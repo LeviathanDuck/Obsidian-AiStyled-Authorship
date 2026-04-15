@@ -6,7 +6,7 @@ An Obsidian plugin that replicates iA Writer's "paste as AI author" feature: tex
 
 ## Status
 
-Under active development. Spec lives at `../../1.Orthanc/workshop/leftcoast-authorship-plugin/`.
+Under active development. Spec lives at `../../1.Orthanc/workshop/personal-projects/leftcoast-authorship-plugin/`.
 
 ## Development
 
