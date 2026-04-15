@@ -1,10 +1,13 @@
 import {
+  App,
   Editor,
   MarkdownView,
   Menu,
   Notice,
   Platform,
   Plugin,
+  PluginSettingTab,
+  Setting,
   TFile,
   normalizePath,
   type DataAdapter,
@@ -43,6 +46,16 @@ interface SidecarData {
   file: string;
   ranges: { from: number; to: number; author: "ai" }[];
 }
+
+// ---- settings ----
+
+interface AuthorshipSettings {
+  showAIStyling: boolean;
+}
+
+const DEFAULT_SETTINGS: AuthorshipSettings = {
+  showAIStyling: true,
+};
 
 // ---- state effects & field ----
 
@@ -489,13 +502,19 @@ const WRITE_DEBOUNCE_MS = 300;
 export default class LeftcoastAuthorshipPlugin extends Plugin {
   private writeTimers: Map<string, number> = new Map();
   private lastPersisted: Map<string, AIRange[]> = new Map();
+  settings: AuthorshipSettings = { ...DEFAULT_SETTINGS };
 
   async onload() {
+    await this.loadSettings();
+
     this.registerEditorExtension([
       aiRangeField,
       clipboardHandlers,
       createHighlightPlugin(view => this.onRangesMaybeChanged(view)),
     ]);
+
+    this.addSettingTab(new AuthorshipSettingTab(this.app, this));
+    this.applyStylingToggle();
 
     this.addCommand({
       id: "paste-as-ai",
@@ -723,10 +742,76 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     this.lastPersisted.set(notePath, ranges);
   }
 
+  async loadSettings() {
+    const loaded = (await this.loadData()) ?? {};
+    this.settings = { ...DEFAULT_SETTINGS, ...loaded };
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+    this.applyStylingToggle();
+  }
+
+  applyStylingToggle() {
+    document.body.classList.toggle(
+      "leftcoast-ai-disabled",
+      !this.settings.showAIStyling
+    );
+  }
+
   async onunload() {
     // Flush any pending writes synchronously-ish before unload
     for (const [, id] of this.writeTimers) window.clearTimeout(id);
     this.writeTimers.clear();
+    document.body.classList.remove("leftcoast-ai-disabled");
     console.log("AiStyled-Authorship: unloaded");
+  }
+}
+
+// ---- settings tab ----
+
+class AuthorshipSettingTab extends PluginSettingTab {
+  plugin: LeftcoastAuthorshipPlugin;
+
+  constructor(app: App, plugin: LeftcoastAuthorshipPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    new Setting(containerEl)
+      .setName("Show AI authorship styling")
+      .setDesc(
+        "Display the gradient on AI-tagged text. When off, the gradient is hidden but authorship metadata is preserved — turn it back on to see the marker again."
+      )
+      .addToggle(toggle =>
+        toggle
+          .setValue(this.plugin.settings.showAIStyling)
+          .onChange(async value => {
+            this.plugin.settings.showAIStyling = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    containerEl.createEl("h3", { text: "About" });
+
+    const p1 = containerEl.createEl("p");
+    p1.appendText("Authorship data is stored in a ");
+    p1.createEl("code", { text: ".authorship/" });
+    p1.appendText(
+      " folder at the root of your vault. The folder syncs with Obsidian Sync, iCloud Drive, Dropbox, or any other vault sync tool — the gradient follows your notes across devices automatically."
+    );
+
+    const p2 = containerEl.createEl("p");
+    p2.appendText(
+      "Typing inside AI-styled text produces normal characters. The gradient only survives where you haven't edited it — so the marker fades in proportion to how much of the text has come from you."
+    );
+
+    const p3 = containerEl.createEl("p");
+    p3.setAttr("style", "color: var(--text-muted); font-size: 0.9em;");
+    p3.appendText("A project of the Leviathan Duck from Leftcoast Media House Inc.");
   }
 }

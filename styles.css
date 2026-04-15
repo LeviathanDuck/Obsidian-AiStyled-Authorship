@@ -15,3 +15,13 @@
   background: transparent !important;
   text-decoration-color: inherit !important;
 }
+
+/* When the user disables "Show AI authorship styling", the body class is
+   toggled on and this rule unsets the per-chunk inline color so text
+   renders at its default theme color. Data is preserved — toggle back
+   on to see the gradient again. */
+body.leftcoast-ai-disabled .leftcoast-ai-chunk,
+body.leftcoast-ai-disabled .leftcoast-ai-chunk * {
+  color: unset !important;
+  -webkit-text-fill-color: unset !important;
+}
