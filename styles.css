@@ -1,1 +1,17 @@
-/* Leftcoast Authorship plugin styles. Placeholder for Phase 2+. */
+/* Leftcoast Authorship — per-character gradient coloring.
+
+   Colors come from inline styles on each chunk (set by main.ts), so
+   the gradient is continuous across line wraps — each character has
+   its own color along the gradient curve, not a CSS background
+   gradient that resets on every line.
+
+   Descendants (bold, italic, links, code, headings) inherit the chunk
+   color via !important color: inherit, so theme rules that set color
+   or -webkit-text-fill-color on nested elements can't break through. */
+
+.leftcoast-ai-chunk * {
+  color: inherit !important;
+  -webkit-text-fill-color: inherit !important;
+  background: transparent !important;
+  text-decoration-color: inherit !important;
+}
