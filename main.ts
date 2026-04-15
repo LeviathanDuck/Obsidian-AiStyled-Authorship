@@ -54,6 +54,7 @@ interface AuthorshipSettings {
   showPasteMenuItem: boolean;
   showMarkSelectionMenuItem: boolean;
   showRemoveMenuItem: boolean;
+  gradientStops: string[];
 }
 
 const DEFAULT_SETTINGS: AuthorshipSettings = {
@@ -61,6 +62,13 @@ const DEFAULT_SETTINGS: AuthorshipSettings = {
   showPasteMenuItem: true,
   showMarkSelectionMenuItem: true,
   showRemoveMenuItem: true,
+  gradientStops: [
+    "#78A8FF",
+    "#8F98FF",
+    "#A786F3",
+    "#CB7FE2",
+    "#F08BC8",
+  ],
 };
 
 // ---- state effects & field ----
@@ -68,6 +76,7 @@ const DEFAULT_SETTINGS: AuthorshipSettings = {
 const addAIRange = StateEffect.define<AIRange>();
 const replaceAIRanges = StateEffect.define<AIRange[]>();
 const clearAIRange = StateEffect.define<AIRange>();
+const refreshDecorationsEffect = StateEffect.define<null>();
 
 const aiRangeField = StateField.define<AIRange[]>({
   create: () => [],
@@ -266,23 +275,52 @@ async function moveSidecar(
 
 // ---- gradient rendering ----
 
-const GRADIENT_STOPS: Stop[] = [
-  { pos: 0.0, rgb: { r: 0x78, g: 0xa8, b: 0xff } },
-  { pos: 0.25, rgb: { r: 0x8f, g: 0x98, b: 0xff } },
-  { pos: 0.5, rgb: { r: 0xa7, g: 0x86, b: 0xf3 } },
-  { pos: 0.75, rgb: { r: 0xcb, g: 0x7f, b: 0xe2 } },
-  { pos: 1.0, rgb: { r: 0xf0, g: 0x8b, b: 0xc8 } },
+// Default palette: cascade blue -> pink (the "Cascade" preset).
+const DEFAULT_GRADIENT_HEX: string[] = [
+  "#78A8FF", // core blue
+  "#8F98FF", // blue-violet
+  "#A786F3", // lavender-violet
+  "#CB7FE2", // magenta-violet
+  "#F08BC8", // warm pink edge
+];
+
+// Named presets. "Cascade" must match DEFAULT_GRADIENT_HEX.
+const GRADIENT_PRESETS: { name: string; stops: string[] }[] = [
+  { name: "Cascade",    stops: ["#78A8FF", "#8F98FF", "#A786F3", "#CB7FE2", "#F08BC8"] },
+  { name: "Sunset",     stops: ["#FFB56B", "#FF8E85", "#E56B9A", "#B566C8", "#7E70D8"] },
+  { name: "Ocean",      stops: ["#0B7FB3", "#0AAAB8", "#2ED3B5", "#7DE8AA", "#C4F0A3"] },
+  { name: "Forest",     stops: ["#2A7F52", "#5EA86E", "#A3C97B", "#D9D17B", "#E89B4B"] },
+  { name: "Monochrome", stops: ["#6B6B6B", "#8A8A8A", "#A8A8A8", "#C4C4C4", "#E0E0E0"] },
+  { name: "Deep Blue",  stops: ["#1E3A8A", "#3B5BB5", "#5B7DD6", "#8CA4E5", "#C8D4F0"] },
 ];
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function colorAt(t: number): string {
+function hexToRgb(hex: string): RGB {
+  const h = hex.replace("#", "").trim();
+  const full = h.length === 3 ? h.split("").map(c => c + c).join("") : h;
+  return {
+    r: parseInt(full.slice(0, 2), 16) || 0,
+    g: parseInt(full.slice(2, 4), 16) || 0,
+    b: parseInt(full.slice(4, 6), 16) || 0,
+  };
+}
+
+function stopsFromHex(hex: string[]): Stop[] {
+  if (hex.length < 2) hex = DEFAULT_GRADIENT_HEX;
+  return hex.map((h, i) => ({
+    pos: i / (hex.length - 1),
+    rgb: hexToRgb(h),
+  }));
+}
+
+function colorAt(stops: Stop[], t: number): string {
   const tc = clamp(t, 0, 1);
-  for (let i = 0; i < GRADIENT_STOPS.length - 1; i++) {
-    const start = GRADIENT_STOPS[i];
-    const end = GRADIENT_STOPS[i + 1];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const start = stops[i];
+    const end = stops[i + 1];
     if (tc <= end.pos) {
       const local = (tc - start.pos) / (end.pos - start.pos);
       const r = Math.round(start.rgb.r + (end.rgb.r - start.rgb.r) * local);
@@ -291,7 +329,7 @@ function colorAt(t: number): string {
       return `rgb(${r},${g},${b})`;
     }
   }
-  const last = GRADIENT_STOPS[GRADIENT_STOPS.length - 1].rgb;
+  const last = stops[stops.length - 1].rgb;
   return `rgb(${last.r},${last.g},${last.b})`;
 }
 
@@ -447,7 +485,10 @@ const clipboardHandlers = EditorView.domEventHandlers({
 
 // ---- highlight view plugin ----
 
-function createHighlightPlugin(onRangesMaybeChanged: (view: EditorView) => void) {
+function createHighlightPlugin(
+  onRangesMaybeChanged: (view: EditorView) => void,
+  getStops: () => Stop[]
+) {
   return ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
@@ -461,7 +502,16 @@ function createHighlightPlugin(onRangesMaybeChanged: (view: EditorView) => void)
           update.state.field(aiRangeField, false) !==
           update.startState.field(aiRangeField, false);
 
-        if (update.docChanged || update.viewportChanged || rangesChanged) {
+        const refreshRequested = update.transactions.some(tr =>
+          tr.effects.some(e => e.is(refreshDecorationsEffect))
+        );
+
+        if (
+          update.docChanged ||
+          update.viewportChanged ||
+          rangesChanged ||
+          refreshRequested
+        ) {
           this.decorations = this.build(update.view);
         }
 
@@ -474,6 +524,7 @@ function createHighlightPlugin(onRangesMaybeChanged: (view: EditorView) => void)
         const builder = new RangeSetBuilder<Decoration>();
         const ranges = view.state.field(aiRangeField, false) ?? [];
         const docLength = view.state.doc.length;
+        const stops = getStops();
 
         for (const range of ranges) {
           const from = Math.max(0, range.from);
@@ -498,7 +549,7 @@ function createHighlightPlugin(onRangesMaybeChanged: (view: EditorView) => void)
                   const normalized = (pos - block.from) / blockLen;
                   const x = fieldLeft + normalized * fieldSpan;
                   const d = clamp(Math.abs(x - centerX) / field.radius, 0, 1);
-                  builder.add(pos, chunkEnd, buildLineDecoration(colorAt(d)));
+                  builder.add(pos, chunkEnd, buildLineDecoration(colorAt(stops, d)));
                 }
               }
 
@@ -530,7 +581,10 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     this.registerEditorExtension([
       aiRangeField,
       clipboardHandlers,
-      createHighlightPlugin(view => this.onRangesMaybeChanged(view)),
+      createHighlightPlugin(
+        view => this.onRangesMaybeChanged(view),
+        () => stopsFromHex(this.settings.gradientStops)
+      ),
     ]);
 
     this.addSettingTab(new AuthorshipSettingTab(this.app, this));
@@ -811,6 +865,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     this.applyStylingToggle();
+    this.refreshAllEditors();
   }
 
   applyStylingToggle() {
@@ -818,6 +873,18 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       "leftcoast-ai-disabled",
       !this.settings.showAIStyling
     );
+  }
+
+  refreshAllEditors() {
+    this.app.workspace.iterateAllLeaves(leaf => {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) return;
+      // @ts-ignore
+      const cm: EditorView | undefined = (view.editor as any)?.cm;
+      if (cm) {
+        cm.dispatch({ effects: refreshDecorationsEffect.of(null) });
+      }
+    });
   }
 
   async onunload() {
@@ -855,6 +922,75 @@ class AuthorshipSettingTab extends PluginSettingTab {
             this.plugin.settings.showAIStyling = value;
             await this.plugin.saveSettings();
           })
+      );
+
+    containerEl.createEl("h3", { text: "Gradient colors" });
+
+    const presetHint = containerEl.createEl("p");
+    presetHint.setAttr("style", "color: var(--text-muted); font-size: 0.9em; margin-top: -0.4em;");
+    presetHint.appendText("Pick a preset below, or customize each stop with the color pickers.");
+
+    const presetRow = containerEl.createDiv();
+    presetRow.setAttr(
+      "style",
+      "display: flex; flex-wrap: wrap; gap: 8px; margin: 0.5em 0 1em 0;"
+    );
+
+    for (const preset of GRADIENT_PRESETS) {
+      const btn = presetRow.createEl("button", { text: preset.name });
+      const gradientCSS = `linear-gradient(90deg, ${preset.stops.join(", ")})`;
+      btn.setAttr(
+        "style",
+        `background: ${gradientCSS}; color: white; text-shadow: 0 1px 2px rgba(0,0,0,0.5); ` +
+          "border: 1px solid var(--background-modifier-border); border-radius: 6px; " +
+          "padding: 6px 12px; cursor: pointer; font-size: 0.9em; font-weight: 500;"
+      );
+      btn.addEventListener("click", async () => {
+        this.plugin.settings.gradientStops = [...preset.stops];
+        await this.plugin.saveSettings();
+        this.display(); // re-render the settings tab so the color pickers update
+      });
+    }
+
+    const pickerRow = containerEl.createDiv();
+    pickerRow.setAttr(
+      "style",
+      "display: flex; gap: 10px; align-items: center; margin: 0.5em 0 1em 0;"
+    );
+    const pickerLabel = pickerRow.createEl("span", { text: "Stops:" });
+    pickerLabel.setAttr("style", "font-size: 0.9em; color: var(--text-muted);");
+
+    for (let i = 0; i < this.plugin.settings.gradientStops.length; i++) {
+      const input = pickerRow.createEl("input", { type: "color" });
+      input.value = this.plugin.settings.gradientStops[i];
+      input.setAttr(
+        "style",
+        "width: 36px; height: 36px; border: 1px solid var(--background-modifier-border); " +
+          "border-radius: 6px; padding: 0; cursor: pointer; background: transparent;"
+      );
+      input.addEventListener("input", async () => {
+        this.plugin.settings.gradientStops[i] = input.value.toUpperCase();
+        await this.plugin.saveSettings();
+      });
+    }
+
+    const previewRow = containerEl.createDiv();
+    const previewGradient = `linear-gradient(90deg, ${this.plugin.settings.gradientStops.join(", ")})`;
+    previewRow.setAttr(
+      "style",
+      `height: 20px; border-radius: 6px; background: ${previewGradient}; ` +
+        "margin-bottom: 1em; border: 1px solid var(--background-modifier-border);"
+    );
+
+    new Setting(containerEl)
+      .setName("Reset gradient to default")
+      .setDesc("Restore the Cascade preset (pink ↔ blue).")
+      .addButton(btn =>
+        btn.setButtonText("Reset").onClick(async () => {
+          this.plugin.settings.gradientStops = [...DEFAULT_SETTINGS.gradientStops];
+          await this.plugin.saveSettings();
+          this.display();
+        })
       );
 
     containerEl.createEl("h3", { text: "Right-click menu" });
