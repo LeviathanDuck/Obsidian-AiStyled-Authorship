@@ -143,6 +143,20 @@ function selectionOverlapsAI(view: EditorView, selFrom: number, selTo: number): 
   return false;
 }
 
+function selectionFullyAI(view: EditorView, selFrom: number, selTo: number): boolean {
+  if (selTo <= selFrom) return false;
+  const ranges = view.state.field(aiRangeField, false) ?? [];
+  // Walk through ranges sorted by start; see if they collectively cover [selFrom, selTo].
+  let cursor = selFrom;
+  for (const r of ranges) {
+    if (r.to <= cursor) continue;
+    if (r.from > cursor) return false; // gap — not fully covered
+    cursor = r.to;
+    if (cursor >= selTo) return true;
+  }
+  return cursor >= selTo;
+}
+
 function normalizeRanges(ranges: AIRange[]): AIRange[] {
   let next: AIRange[] = [];
   for (const range of ranges) {
@@ -525,6 +539,14 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "mark-selection-as-ai",
+      name: "Mark Selection as AI Style",
+      editorCallback: (editor: Editor) => {
+        this.runMarkSelectionAsAI(editor);
+      },
+    });
+
+    this.addCommand({
       id: "remove-ai-styling",
       name: "Remove AI Styling",
       editorCallback: (editor: Editor) => {
@@ -543,11 +565,25 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
             });
         });
 
-        // Only show "Remove AI Styling" when the selection overlaps an AI range.
         // @ts-ignore Obsidian exposes the CM6 EditorView via editor.cm
         const cm: EditorView | undefined = (editor as any).cm;
         if (cm) {
           const sel = cm.state.selection.main;
+
+          // Show "Mark Selection as AI Style" when selection is non-empty and
+          // not already fully covered by an AI range.
+          if (!sel.empty && !selectionFullyAI(cm, sel.from, sel.to)) {
+            menu.addItem(item => {
+              item
+                .setTitle("Mark Selection as AI Style")
+                .setIcon("wand")
+                .onClick(() => {
+                  this.runMarkSelectionAsAI(editor);
+                });
+            });
+          }
+
+          // Show "Remove AI Styling" when selection overlaps an AI range.
           if (!sel.empty && selectionOverlapsAI(cm, sel.from, sel.to)) {
             menu.addItem(item => {
               item
@@ -628,6 +664,23 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       return;
     }
     this.pasteAsAI(editor, text);
+  }
+
+  private runMarkSelectionAsAI(editor: Editor) {
+    // @ts-ignore Obsidian exposes the CM6 EditorView via editor.cm
+    const cm: EditorView = (editor as any).cm;
+    if (!cm) {
+      new Notice("Could not access editor");
+      return;
+    }
+    const sel = cm.state.selection.main;
+    if (sel.empty) {
+      new Notice("Select text to mark as AI-styled");
+      return;
+    }
+    cm.dispatch({
+      effects: addAIRange.of({ from: sel.from, to: sel.to }),
+    });
   }
 
   private runRemoveAI(editor: Editor) {
