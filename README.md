@@ -14,7 +14,7 @@ This plugin is an independent implementation. No iA Writer code is used. iA Writ
 
 ## Status
 
-Under active development. Spec lives at `../../1.Orthanc/workshop/Plugins/leftcoast-authorship-plugin/`.
+Under active development. Spec lives at `../../1.Orthanc/workshop/Plugins/aistyled-authorship-plugin/`.
 
 ## Development
 
@@ -26,7 +26,7 @@ npm run build    # production build (minified, no sourcemaps)
 
 ### Install into an Obsidian vault
 
-Either symlink the plugin folder into a vault's `.obsidian/plugins/` directory, or copy `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/leftcoast-authorship/` after a build. Then enable Community Plugins in Obsidian and turn on **Leftcoast Authorship**.
+Either symlink the plugin folder into a vault's `.obsidian/plugins/` directory, or copy `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/aistyled-authorship/` after a build. Then enable Community Plugins in Obsidian and turn on **AiStyled-Authorship**.
 
 ## Disclaimer
 

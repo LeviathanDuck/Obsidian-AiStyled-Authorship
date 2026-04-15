@@ -171,7 +171,7 @@ async function readSidecar(adapter: DataAdapter, sidecarPath: string): Promise<A
     }
     return normalizeRanges(ranges);
   } catch (err) {
-    console.warn(`Leftcoast Authorship: failed to read sidecar ${sidecarPath}`, err);
+    console.warn(`AiStyled-Authorship: failed to read sidecar ${sidecarPath}`, err);
     return [];
   }
 }
@@ -199,7 +199,7 @@ async function writeSidecar(
     };
     await adapter.write(sidecarPath, JSON.stringify(data, null, 2));
   } catch (err) {
-    console.warn(`Leftcoast Authorship: failed to write sidecar ${sidecarPath}`, err);
+    console.warn(`AiStyled-Authorship: failed to write sidecar ${sidecarPath}`, err);
   }
 }
 
@@ -209,7 +209,7 @@ async function deleteSidecar(adapter: DataAdapter, sidecarPath: string): Promise
       await adapter.remove(sidecarPath);
     }
   } catch (err) {
-    console.warn(`Leftcoast Authorship: failed to delete sidecar ${sidecarPath}`, err);
+    console.warn(`AiStyled-Authorship: failed to delete sidecar ${sidecarPath}`, err);
   }
 }
 
@@ -227,7 +227,7 @@ async function moveSidecar(
     await adapter.write(toPath, raw);
     await adapter.remove(fromPath);
   } catch (err) {
-    console.warn(`Leftcoast Authorship: failed to move sidecar ${fromPath} -> ${toPath}`, err);
+    console.warn(`AiStyled-Authorship: failed to move sidecar ${fromPath} -> ${toPath}`, err);
   }
 }
 
@@ -323,7 +323,7 @@ async function readClipboardText(): Promise<string | null> {
 
 // ---- clipboard handlers: copy/cut/paste preserve authorship within the vault ----
 
-const CLIPBOARD_MIME = "application/x-leftcoast-authorship+json";
+const CLIPBOARD_MIME = "application/x-aistyled-authorship+json";
 const CLIPBOARD_VERSION = 1;
 
 interface ClipboardAuthorship {
@@ -590,7 +590,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     );
 
     console.log(
-      `Leftcoast Authorship: loaded (${Platform.isMobile ? "mobile" : "desktop"})`
+      `AiStyled-Authorship: loaded (${Platform.isMobile ? "mobile" : "desktop"})`
     );
   }
 
@@ -727,6 +727,6 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     // Flush any pending writes synchronously-ish before unload
     for (const [, id] of this.writeTimers) window.clearTimeout(id);
     this.writeTimers.clear();
-    console.log("Leftcoast Authorship: unloaded");
+    console.log("AiStyled-Authorship: unloaded");
   }
 }

@@ -1,5 +1,5 @@
 {
-  "name": "leftcoast-authorship",
+  "name": "aistyled-authorship",
   "version": "0.1.0",
   "description": "iA Writer-style per-character AI authorship tracking for Obsidian.",
   "main": "main.js",
