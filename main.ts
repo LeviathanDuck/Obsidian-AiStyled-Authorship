@@ -215,7 +215,8 @@ function sameRanges(a: AIRange[], b: AIRange[]): boolean {
 
 // ---- sidecar I/O ----
 
-const SIDECAR_FOLDER = ".authorship";
+const SIDECAR_FOLDER = "authorship";
+const OLD_SIDECAR_FOLDER = ".authorship";
 const SIDECAR_VERSION = 1;
 
 function encodeSidecarPath(notePath: string): string {
@@ -802,6 +803,10 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     this.addSettingTab(new AuthorshipSettingTab(this.app, this));
     this.applyStylingToggle();
 
+    // One-time migration: move sidecars from .authorship/ to authorship/.
+    // iOS iCloud Drive doesn't sync dotfolders reliably.
+    void this.migrateSidecarFolder();
+
     this.addCommand({
       id: "paste-as-ai",
       name: "Paste with AI Style",
@@ -858,7 +863,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
             menu.addItem(item => {
               item
                 .setTitle("Mark Selection as AI Style")
-                .setIcon("wand")
+                .setIcon("highlighter")
                 .onClick(() => {
                   this.runMarkSelectionAsAI(editor);
                 });
@@ -1248,6 +1253,37 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     await writeSidecar(this.app.vault.adapter, sidecarPath, notePath, ranges);
     console.warn("[AiStyled PERSIST] writeSidecar completed for", sidecarPath);
     this.lastPersisted.set(notePath, ranges);
+  }
+
+  private async migrateSidecarFolder() {
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!(await adapter.exists(OLD_SIDECAR_FOLDER))) return;
+      const listing = await adapter.list(OLD_SIDECAR_FOLDER);
+      if (listing.files.length === 0) {
+        await adapter.rmdir(OLD_SIDECAR_FOLDER, false);
+        return;
+      }
+      if (!(await adapter.exists(SIDECAR_FOLDER))) {
+        await adapter.mkdir(SIDECAR_FOLDER);
+      }
+      for (const oldPath of listing.files) {
+        const filename = oldPath.split("/").pop();
+        if (!filename) continue;
+        const newPath = normalizePath(`${SIDECAR_FOLDER}/${filename}`);
+        try {
+          const content = await adapter.read(oldPath);
+          await adapter.write(newPath, content);
+          await adapter.remove(oldPath);
+        } catch {
+          // skip individual file errors
+        }
+      }
+      await adapter.rmdir(OLD_SIDECAR_FOLDER, false).catch(() => {});
+      console.log("AiStyled-Authorship: migrated sidecar folder from .authorship/ to authorship/");
+    } catch (err) {
+      console.warn("AiStyled-Authorship: sidecar migration failed", err);
+    }
   }
 
   async loadSettings() {
