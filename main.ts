@@ -617,6 +617,11 @@ function createHighlightPlugin(
     class {
       decorations: DecorationSet = Decoration.none;
       private pending = false;
+      // Set to true right before we dispatch our post-measure refresh effect.
+      // That dispatch's update cycle should skip rescheduling (decorations
+      // are already up-to-date). External refresh effects (from settings
+      // changes) DON'T set this flag, so they DO trigger a rebuild.
+      private selfRefreshPending = false;
 
       constructor(view: EditorView) {
         this.schedule(view);
@@ -631,20 +636,23 @@ function createHighlightPlugin(
           tr.effects.some(e => e.is(refreshDecorationsEffect))
         );
 
-        // If the only signal is our own refresh-dispatch (no doc, viewport,
-        // or range changes), skip re-scheduling. this.decorations was set
-        // in the measure-write phase; the dispatch's purpose was just to
-        // trigger a paint. Re-scheduling here would loop.
         if (
           refreshRequested &&
+          this.selfRefreshPending &&
           !update.docChanged &&
           !update.viewportChanged &&
           !rangesChanged
         ) {
+          this.selfRefreshPending = false;
           return;
         }
 
-        if (update.docChanged || update.viewportChanged || rangesChanged) {
+        if (
+          update.docChanged ||
+          update.viewportChanged ||
+          rangesChanged ||
+          refreshRequested
+        ) {
           this.schedule(update.view);
         }
 
@@ -668,7 +676,9 @@ function createHighlightPlugin(
             if (!decos) return;
             this.decorations = decos;
             // Dispatching during measure is forbidden. Defer out of the
-            // current update cycle.
+            // current update cycle. Flag this as a self-refresh so the
+            // update handler doesn't reschedule another measure.
+            this.selfRefreshPending = true;
             window.setTimeout(() => {
               if (!v.dom.isConnected) return;
               v.dispatch({ effects: refreshDecorationsEffect.of(null) });
@@ -954,27 +964,28 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     try {
       const source = await this.app.vault.cachedRead(file);
       const lines = source.split("\n");
+
+      // Compute the absolute character range of this rendered section.
       let sectionStartOffset = 0;
-      for (let i = 0; i < section.lineStart; i++) {
+      for (let i = 0; i < section.lineStart && i < lines.length; i++) {
         sectionStartOffset += lines[i].length + 1;
       }
       let sectionEndOffset = sectionStartOffset;
       for (let i = section.lineStart; i <= section.lineEnd && i < lines.length; i++) {
-        sectionEndOffset += lines[i].length + (i < section.lineEnd ? 1 : 0);
+        sectionEndOffset += lines[i].length;
+        if (i < section.lineEnd) sectionEndOffset += 1;
       }
 
-      const aiInSection: { from: number; to: number }[] = [];
+      // Does any AI range intersect this section?
+      let intersects = false;
       for (const r of ranges) {
-        const from = Math.max(r.from, sectionStartOffset);
-        const to = Math.min(r.to, sectionEndOffset);
-        if (to > from) aiInSection.push({ from, to });
+        if (r.to > sectionStartOffset && r.from < sectionEndOffset) {
+          intersects = true;
+          break;
+        }
       }
-      if (aiInSection.length === 0) return;
+      if (!intersects) return;
 
-      // Coarse reading-mode highlight: apply a simple CSS gradient to each
-      // block-level element in this section that contains AI text. Not
-      // per-character — reading mode renders Markdown so source offsets
-      // don't map cleanly to DOM positions.
       const stops = stopsFromHex(this.settings.gradientStops);
       const colorStops: string[] = [];
       const N = 10;
@@ -985,28 +996,31 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       }
       const gradient = `linear-gradient(90deg, ${colorStops.join(", ")})`;
 
-      const blockElements = el.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, blockquote");
-      blockElements.forEach(block => {
-        const blockText = (block.textContent ?? "").trim();
-        if (blockText.length === 0) return;
-        // If any AI range text substring appears in this block, style it.
-        for (const r of aiInSection) {
-          const aiText = source.slice(r.from, r.to).trim();
-          if (aiText.length === 0) continue;
-          if (blockText.includes(aiText.slice(0, Math.min(30, aiText.length)))) {
-            (block as HTMLElement).style.cssText +=
-              `background: ${gradient} !important; ` +
-              "background-clip: text !important; " +
-              "-webkit-background-clip: text !important; " +
-              "color: transparent !important; " +
-              "-webkit-text-fill-color: transparent !important;";
-            break;
-          }
-        }
-      });
+      // Apply the gradient to the section element itself. Reading-mode
+      // source-to-DOM mapping isn't precise enough to highlight sub-section
+      // ranges reliably — so we highlight the whole section if it contains
+      // any AI-tagged content. Coarse but correct (no false positives on
+      // unrelated sections).
+      el.style.setProperty("background", gradient, "important");
+      el.style.setProperty("background-clip", "text", "important");
+      el.style.setProperty("-webkit-background-clip", "text", "important");
+      el.style.setProperty("color", "transparent", "important");
+      el.style.setProperty("-webkit-text-fill-color", "transparent", "important");
     } catch (err) {
       console.warn("AiStyled-Authorship: reading-mode highlight failed", err);
     }
+  }
+
+  private refreshAllReadingViews() {
+    this.app.workspace.iterateAllLeaves(leaf => {
+      const view = leaf.view;
+      if (view instanceof MarkdownView) {
+        // @ts-ignore previewMode has a rerender method in practice
+        if (view.previewMode && typeof (view.previewMode as any).rerender === "function") {
+          (view.previewMode as any).rerender(true);
+        }
+      }
+    });
   }
 
   private async runPasteWithAI(editor: Editor) {
@@ -1299,6 +1313,9 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     await this.saveData(this.settings);
     this.applyStylingToggle();
     this.refreshAllEditors();
+    if (this.settings.showInReadingMode) {
+      this.refreshAllReadingViews();
+    }
   }
 
   applyStylingToggle() {
