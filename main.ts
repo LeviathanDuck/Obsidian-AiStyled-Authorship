@@ -646,6 +646,7 @@ function createHighlightPlugin(
         if (
           update.docChanged ||
           update.viewportChanged ||
+          update.geometryChanged ||
           rangesChanged ||
           refreshRequested
         ) {
@@ -1028,26 +1029,20 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
 
       if (!intersects) return;
 
+      // Non-destructive indicator: left border + subtle tinted background.
+      // Using background-clip: text on section elements caused layout reflow
+      // artifacts in Obsidian's reading-mode renderer (extra lines, paragraph
+      // jumps). This approach is layout-safe and still clearly marks AI sections.
       const stops = stopsFromHex(this.settings.gradientStops);
-      const colorStops: string[] = [];
-      const N = 10;
-      for (let i = 0; i <= N; i++) {
-        const xFrac = i / N;
-        const d = clamp(Math.abs(xFrac - 0.5) / 0.5, 0, 1);
-        colorStops.push(`${colorAt(stops, d)} ${(xFrac * 100).toFixed(1)}%`);
-      }
-      const gradient = `linear-gradient(90deg, ${colorStops.join(", ")})`;
+      const coreColor = colorAt(stops, 0); // the ribbon's center color
+      const edgeColor = colorAt(stops, 1); // the ribbon's edge color
 
-      // Apply the gradient to the section element itself. Reading-mode
-      // source-to-DOM mapping isn't precise enough to highlight sub-section
-      // ranges reliably — so we highlight the whole section if it contains
-      // any AI-tagged content. Coarse but correct (no false positives on
-      // unrelated sections).
-      el.style.setProperty("background", gradient, "important");
-      el.style.setProperty("background-clip", "text", "important");
-      el.style.setProperty("-webkit-background-clip", "text", "important");
-      el.style.setProperty("color", "transparent", "important");
-      el.style.setProperty("-webkit-text-fill-color", "transparent", "important");
+      el.classList.add("leftcoast-ai-reading-section");
+      el.style.setProperty("border-left", `3px solid ${coreColor}`);
+      el.style.setProperty("padding-left", "10px");
+      el.style.setProperty("background",
+        `linear-gradient(90deg, ${coreColor}15, transparent 40%)`
+      );
     } catch (err) {
       console.warn("AiStyled-Authorship: reading-mode highlight failed", err);
     }
