@@ -947,8 +947,24 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       }
 
       if (!ranges || ranges.length === 0) {
+        // Fallback: lastPersisted might not be populated yet (race with
+        // hydration). Try reading the sidecar directly.
+        const file = this.app.vault.getAbstractFileByPath(sourcePath);
+        if (file instanceof TFile) {
+          const sidecarPath = encodeSidecarPath(sourcePath);
+          void readSidecar(this.app.vault.adapter, sidecarPath).then(
+            sidecarRanges => {
+              if (sidecarRanges.length > 0) {
+                this.lastPersisted.set(sourcePath, sidecarRanges);
+                if (this.settings.showInReadingMode) {
+                  this.refreshAllReadingViews();
+                }
+              }
+            }
+          );
+        }
         if (this.settings.debug) {
-          console.log("no ranges → skip");
+          console.log("no ranges in lastPersisted → async sidecar read queued");
           console.groupEnd();
         }
         return;
@@ -1029,20 +1045,9 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
 
       if (!intersects) return;
 
-      // Non-destructive indicator: left border + subtle tinted background.
-      // Using background-clip: text on section elements caused layout reflow
-      // artifacts in Obsidian's reading-mode renderer (extra lines, paragraph
-      // jumps). This approach is layout-safe and still clearly marks AI sections.
-      const stops = stopsFromHex(this.settings.gradientStops);
-      const coreColor = colorAt(stops, 0); // the ribbon's center color
-      const edgeColor = colorAt(stops, 1); // the ribbon's edge color
-
+      // Add a class — all styling handled in CSS via custom properties.
+      // No inline styles that could break Obsidian's reading-mode layout.
       el.classList.add("leftcoast-ai-reading-section");
-      el.style.setProperty("border-left", `3px solid ${coreColor}`);
-      el.style.setProperty("padding-left", "10px");
-      el.style.setProperty("background",
-        `linear-gradient(90deg, ${coreColor}15, transparent 40%)`
-      );
     } catch (err) {
       console.warn("AiStyled-Authorship: reading-mode highlight failed", err);
     }
@@ -1359,6 +1364,22 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     document.body.classList.toggle(
       "leftcoast-ai-disabled",
       !this.settings.showAIStyling
+    );
+    this.applyReadingModeGradientVars();
+  }
+
+  applyReadingModeGradientVars() {
+    const stops = stopsFromHex(this.settings.gradientStops);
+    const N = 10;
+    const parts: string[] = [];
+    for (let i = 0; i <= N; i++) {
+      const xFrac = i / N;
+      const d = clamp(Math.abs(xFrac - 0.5) / 0.5, 0, 1);
+      parts.push(`${colorAt(stops, d)} ${(xFrac * 100).toFixed(1)}%`);
+    }
+    document.body.style.setProperty(
+      "--ai-reading-gradient",
+      `linear-gradient(90deg, ${parts.join(", ")})`
     );
   }
 
