@@ -215,14 +215,13 @@ function sameRanges(a: AIRange[], b: AIRange[]): boolean {
 
 // ---- sidecar I/O ----
 
-// Sidecars now live inside the plugin's own installed folder, under
-// `<configDir>/plugins/<PLUGIN_ID>/<SIDECAR_SUBFOLDER>/`. The plugin
-// computes this path at runtime from `app.vault.configDir` so it works
-// regardless of vault location, OS, or a user-renamed config folder.
-// Legacy locations are migrated forward on load.
+// Sidecars live in a visible `authorship/` folder at the vault root.
+// Rides the same sync path as markdown when "Sync all other file types"
+// is enabled in Obsidian Sync. We tried `<configDir>/plugins/<id>/...`
+// in 0.1.8 but Obsidian Sync does not continuously sync runtime-written
+// files inside plugin folders — 0.1.9 reverts and migrates back.
 const PLUGIN_ID = "aistyled-authorship";
-const SIDECAR_SUBFOLDER = "authorship";
-const LEGACY_ROOT_FOLDER = "authorship";
+const SIDECAR_FOLDER = "authorship";
 const LEGACY_DOT_FOLDER = ".authorship";
 const SIDECAR_VERSION = 1;
 
@@ -932,14 +931,12 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     );
 
     // Sidecar arrived via sync — merge its ranges with the current editor
-    // state (union). Vault events only fire for files inside the vault
-    // proper, so this listener no longer fires for sidecars now that they
-    // live under `<configDir>/plugins/<id>/`. Cross-device updates are
-    // picked up on next note open via hydrateFile instead. Kept for files
-    // that may still land at the legacy vault-root location.
+    // state (union). This way ranges from other devices are ADDED to this
+    // device's ranges, not replace-or-skip. Supports multi-device editing
+    // where each device adds its own AI styling.
     const onSidecarTouched = (filePath: string) => {
-      if (!filePath.startsWith(LEGACY_ROOT_FOLDER + "/")) return;
-      const filename = filePath.slice(LEGACY_ROOT_FOLDER.length + 1);
+      if (!filePath.startsWith(SIDECAR_FOLDER + "/")) return;
+      const filename = filePath.slice(SIDECAR_FOLDER.length + 1);
       const encoded = filename.endsWith(".json") ? filename.slice(0, -5) : filename;
       const notePath = encoded.replace(/__/g, "/");
       const noteFile = this.app.vault.getAbstractFileByPath(notePath);
@@ -1331,19 +1328,24 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
   }
 
   private get sidecarFolder(): string {
-    return normalizePath(
-      `${this.app.vault.configDir}/plugins/${PLUGIN_ID}/${SIDECAR_SUBFOLDER}`
-    );
+    return SIDECAR_FOLDER;
+  }
+
+  private get pluginFolderSidecarPath(): string {
+    // 0.1.8 stored sidecars here; 0.1.9+ migrates them back to vault root.
+    return normalizePath(`${this.app.vault.configDir}/plugins/${PLUGIN_ID}/authorship`);
   }
 
   private async migrateSidecarFolder() {
-    // 0.1.8 migration: copy sidecars from legacy vault-root locations into
-    // the plugin-folder location. We COPY (not move) and leave the old
-    // folders intact — the wizard removes them manually once the new
-    // location is verified working across devices.
+    // Migrations run on every load. We COPY (not move) and leave old
+    // folders intact so the wizard can verify before cleanup. Idempotent
+    // — sidecars already present in the target are skipped.
+    //
+    //   .authorship/                             -> authorship/   (very old dotfolder)
+    //   <configDir>/plugins/<id>/authorship/     -> authorship/   (0.1.8, doesn't sync)
     const adapter = this.app.vault.adapter;
     const target = this.sidecarFolder;
-    const legacyLocations = [LEGACY_DOT_FOLDER, LEGACY_ROOT_FOLDER];
+    const legacyLocations = [LEGACY_DOT_FOLDER, this.pluginFolderSidecarPath];
 
     for (const src of legacyLocations) {
       try {
@@ -1508,20 +1510,16 @@ class AuthorshipSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     const { syncEnabled, otherTypesEnabled } = this.detectSyncConfig();
 
-    // 0.1.8: sidecars now live inside the plugin's installed folder
-    // (<configDir>/plugins/<id>/authorship/). The sync path no longer
-    // depends on "Sync all other file types" — it's tied to plugin sync
-    // toggles instead. Until we can reliably detect those specific
-    // toggles, show an info banner whenever Obsidian Sync is enabled so
-    // the user knows which setting governs multi-device styling now.
-    // `otherTypesEnabled` is retained from detectSyncConfig for possible
-    // future diagnostics but no longer drives banner severity.
-    void otherTypesEnabled;
-    if (!syncEnabled) return;
+    // Only show the banner when something might need attention.
+    // Case 1: sync enabled AND we confirmed "other types" is off → red warning
+    // Case 2: sync enabled AND we couldn't detect → soft reminder
+    // Case 3: sync disabled → info only if using Obsidian Sync
+    // Case 4: "other types" is on → no banner (happy path)
+    if (syncEnabled && otherTypesEnabled === true) return;
 
     const banner = containerEl.createDiv();
-    const isError = false;
-    const accent = "#F0B84A";
+    const isError = syncEnabled && otherTypesEnabled === false;
+    const accent = isError ? "#E57373" : "#F0B84A";
     banner.setAttr(
       "style",
       `border-left: 4px solid ${accent}; ` +
@@ -1551,22 +1549,37 @@ class AuthorshipSettingTab extends PluginSettingTab {
       '<path d="M12 19h.01"/>' +
       "</svg>";
     title.createSpan({
-      text: "Multi-device sync now rides plugin sync",
+      text: isError
+        ? "Sync setting required for multi-device styling"
+        : "Check your sync settings for multi-device styling",
     });
 
     const body = banner.createEl("p");
     body.setAttr("style", "margin: 0 0 6px 0; font-size: 0.9em;");
-    body.appendText(
-      "Styling is stored inside this plugin's installed folder (authorship/ " +
-      "subfolder). For the gradient to appear on your other devices, make " +
-      "sure \"Installed community plugins\" is enabled in Settings → Sync " +
-      "on every device. \"Sync all other file types\" is no longer required."
-    );
+    if (isError) {
+      body.appendText(
+        "Obsidian Sync is running, but \"Sync all other file types\" appears to be off. " +
+        "AI styling is stored as JSON in the authorship/ folder. Without this setting, " +
+        "sidecar files won't sync across devices and styling won't appear on your other devices."
+      );
+    } else if (syncEnabled) {
+      body.appendText(
+        "Obsidian Sync is running, but I can't detect whether \"Sync all other file types\" is enabled. " +
+        "For AI styling to sync across devices, make sure that setting is on. The plugin stores " +
+        "styling as JSON files in the authorship/ folder at your vault root."
+      );
+    } else {
+      body.appendText(
+        "If you use Obsidian Sync (or iCloud Drive / Dropbox / other vault sync), " +
+        "styling syncs via JSON files in the authorship/ folder. For Obsidian Sync specifically, " +
+        "you must enable \"Sync all other file types\" in Settings → Sync."
+      );
+    }
 
     const fix = banner.createEl("p");
     fix.setAttr("style", "margin: 0; font-size: 0.85em; color: var(--text-muted);");
     fix.appendText(
-      "Fix: Settings → Core plugins → Sync → enable \"Installed community plugins\". " +
+      "Fix: Settings → Core plugins → Sync → enable \"Sync all other file types\". " +
       "Do this on every device."
     );
   }
@@ -1576,7 +1589,7 @@ class AuthorshipSettingTab extends PluginSettingTab {
     this.aboutPreviewEl.empty();
 
     const texts: string[] = [
-      "Authorship data is stored inside this plugin's installed folder (authorship/ subfolder). It rides Obsidian's plugin-sync path — enable \"Installed community plugins\" in Settings → Sync and the gradient follows your notes across devices automatically.",
+      "Authorship data is stored in an authorship/ folder at the root of your vault. The folder syncs with Obsidian Sync (enable \"Sync all other file types\"), iCloud Drive, Dropbox, or any other vault sync tool — the gradient follows your notes across devices automatically.",
       "Typing inside AI-styled text produces normal characters. The gradient only survives where you haven't edited it — so the marker fades in proportion to how much of the text has come from you.",
       "A project of the Leviathan Duck from Leftcoast Media House Inc.",
     ];
