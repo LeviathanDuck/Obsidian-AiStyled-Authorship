@@ -1486,18 +1486,40 @@ class AuthorshipSettingTab extends PluginSettingTab {
 
     const banner = containerEl.createDiv();
     const isError = syncEnabled && otherTypesEnabled === false;
+    const accent = isError ? "#E57373" : "#F0B84A";
     banner.setAttr(
       "style",
-      `border-left: 4px solid ${isError ? "#E57373" : "#F0B84A"}; ` +
+      `border-left: 4px solid ${accent}; ` +
         "background: var(--background-secondary); " +
         "padding: 10px 14px; margin-bottom: 16px; border-radius: 4px;"
     );
-    const title = banner.createEl("div", {
+    const title = banner.createEl("div");
+    title.setAttr(
+      "style",
+      "font-weight: 600; margin-bottom: 6px; display: flex; align-items: center; gap: 8px;"
+    );
+    // Inline cloud-with-exclamation SVG — always rendered in the iCloud
+    // sync-error red so every sync banner reads as the same warning icon.
+    // Border-left accent still varies by severity.
+    const iconSpan = title.createSpan();
+    iconSpan.setAttr(
+      "style",
+      "display: inline-flex; color: #E57373; flex-shrink: 0;"
+    );
+    iconSpan.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" ' +
+      'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ' +
+      'aria-hidden="true">' +
+      '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>' +
+      '<path d="M12 12v4"/>' +
+      '<path d="M12 19h.01"/>' +
+      "</svg>";
+    title.createSpan({
       text: isError
-        ? "⚠️ Sync setting required for multi-device styling"
-        : "ℹ️ Check your sync settings for multi-device styling",
+        ? "Sync setting required for multi-device styling"
+        : "Check your sync settings for multi-device styling",
     });
-    title.setAttr("style", "font-weight: 600; margin-bottom: 6px;");
 
     const body = banner.createEl("p");
     body.setAttr("style", "margin: 0 0 6px 0; font-size: 0.9em;");
