@@ -1399,36 +1399,76 @@ class AuthorshipSettingTab extends PluginSettingTab {
 
   private detectSyncConfig(): {
     syncEnabled: boolean;
-    otherTypesEnabled: boolean | null; // null = couldn't detect
+    otherTypesEnabled: boolean | null;
   } {
     try {
       // @ts-ignore — internal Obsidian API
       const syncPlugin = this.plugin.app.internalPlugins?.getPluginById?.("sync");
       if (!syncPlugin?.enabled) {
+        console.warn("[AiStyled SYNC] sync plugin not enabled");
         return { syncEnabled: false, otherTypesEnabled: null };
       }
       // @ts-ignore
       const instance = syncPlugin.instance;
-      // Obsidian Sync config has multiple shape variants; try known paths.
-      const candidates = [
-        instance?.pluginsMode,       // legacy
-        instance?.syncOptions,       // newer
-        instance?.config,            // another shape
+      console.warn("[AiStyled SYNC] sync plugin instance:", instance);
+      console.warn("[AiStyled SYNC] instance keys:", instance ? Object.keys(instance) : "(none)");
+
+      // Dump any object-typed config-ish property so we can see what's there
+      const candidatePaths = [
+        "pluginsMode", "syncOptions", "config", "options", "syncBinaries",
+        "syncAttachments", "binaries", "other", "otherTypes", "types",
+        "syncOtherFiles",
       ];
-      // Common property names across Obsidian versions for "Sync all other types"
-      const knownKeys = ["syncBinaries", "syncOtherFiles", "binaries", "other", "otherTypes"];
-      for (const obj of candidates) {
+      for (const key of candidatePaths) {
+        // @ts-ignore
+        const val = instance?.[key];
+        if (val !== undefined) {
+          console.warn(`[AiStyled SYNC] instance.${key} =`, val);
+        }
+      }
+
+      // Try shallow direct property (sync config is often flat)
+      const directKeys = [
+        "syncBinaries", "syncOtherFiles", "syncAttachments", "syncOther",
+        "otherTypes", "allOther",
+      ];
+      for (const k of directKeys) {
+        // @ts-ignore
+        if (instance?.[k] !== undefined) {
+          // @ts-ignore
+          const v = !!instance[k];
+          console.warn(`[AiStyled SYNC] detected direct ${k} =`, v);
+          return { syncEnabled: true, otherTypesEnabled: v };
+        }
+      }
+
+      // Try nested under common config objects
+      const nestedContainers = [
+        instance?.pluginsMode,
+        instance?.syncOptions,
+        instance?.config,
+        instance?.options,
+      ];
+      const nestedKeys = [
+        "syncBinaries", "syncOtherFiles", "syncAttachments", "binaries",
+        "other", "otherTypes",
+      ];
+      for (const obj of nestedContainers) {
         if (obj && typeof obj === "object") {
-          for (const key of knownKeys) {
-            if (key in obj) {
-              return { syncEnabled: true, otherTypesEnabled: !!obj[key] };
+          for (const k of nestedKeys) {
+            if (k in obj) {
+              const v = !!obj[k];
+              console.warn(`[AiStyled SYNC] detected nested ${k} =`, v);
+              return { syncEnabled: true, otherTypesEnabled: v };
             }
           }
         }
       }
-      // Couldn't find the specific setting — sync is on but we can't tell
+
+      console.warn("[AiStyled SYNC] could not detect other-types setting");
       return { syncEnabled: true, otherTypesEnabled: null };
-    } catch {
+    } catch (err) {
+      console.warn("[AiStyled SYNC] detect error:", err);
       return { syncEnabled: false, otherTypesEnabled: null };
     }
   }
