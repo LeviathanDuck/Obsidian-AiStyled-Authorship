@@ -920,21 +920,18 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       })
     );
 
-    // Sidecar arrived via sync — re-hydrate the corresponding note if it's
-    // currently open. Covers the case where the note opens before the
-    // sidecar has finished downloading from Obsidian Sync.
+    // Sidecar arrived via sync — merge its ranges with the current editor
+    // state (union). This way ranges from other devices are ADDED to this
+    // device's ranges, not replace-or-skip. Supports multi-device editing
+    // where each device adds its own AI styling.
     const onSidecarTouched = (filePath: string) => {
       if (!filePath.startsWith(SIDECAR_FOLDER + "/")) return;
       const filename = filePath.slice(SIDECAR_FOLDER.length + 1);
-      // Decode: strip trailing .json, replace __ with /
       const encoded = filename.endsWith(".json") ? filename.slice(0, -5) : filename;
       const notePath = encoded.replace(/__/g, "/");
       const noteFile = this.app.vault.getAbstractFileByPath(notePath);
       if (!(noteFile instanceof TFile)) return;
-      // Clear hydrated/lastPersisted so hydration re-runs from the new sidecar
-      this.hydrated.delete(notePath);
-      this.lastPersisted.delete(notePath);
-      void this.hydrateFile(noteFile);
+      void this.mergeSidecarIntoView(noteFile);
     };
     this.registerEvent(
       this.app.vault.on("create", file => {
@@ -1151,6 +1148,40 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       changes: { from, to, insert: text },
       effects: addAIRange.of({ from, to: insertEnd }),
       selection: { anchor: insertEnd },
+    });
+  }
+
+  private async mergeSidecarIntoView(file: TFile) {
+    const ranges = await readSidecar(
+      this.app.vault.adapter,
+      encodeSidecarPath(file.path)
+    );
+    if (ranges.length === 0) return;
+
+    const view = this.findEditorView(file);
+    if (!view) {
+      // View isn't open. Still cache so lastPersisted reflects disk state
+      // and next hydrateFile picks it up when the view opens.
+      this.lastPersisted.set(file.path, ranges);
+      return;
+    }
+
+    const current = view.state.field(aiRangeField, false) ?? [];
+    const merged = normalizeRanges([...current, ...ranges]);
+
+    // Skip dispatch if merged is identical to current (nothing new arrived).
+    if (sameRanges(current, merged)) {
+      this.lastPersisted.set(file.path, merged);
+      this.hydrated.add(file.path);
+      return;
+    }
+
+    queueMicrotask(() => {
+      const liveView = this.findEditorView(file);
+      if (!liveView) return;
+      liveView.dispatch({ effects: replaceAIRanges.of(merged) });
+      this.lastPersisted.set(file.path, merged);
+      this.hydrated.add(file.path);
     });
   }
 
