@@ -1,5 +1,7 @@
 # Ai Styled Text Authorship For Obsidian
 
+> 🧪 **Public beta.** This plugin is in active testing. If you hit something unexpected, please [submit an issue on GitHub](https://github.com/LeviathanDuck/Obsidian-AiStyled-Authorship/issues) — thanks for helping make it better.
+
 An Obsidian plugin that replicates iA Writer's "paste as AI author" feature: text pasted via the plugin's command is visually marked with a colored gradient, tracked per-character, and persists across sessions and devices.
 
 ![AiStyled-Authorship Plugin Examples](assets/AiAuthorship%20Plugin%20Examples.png)
