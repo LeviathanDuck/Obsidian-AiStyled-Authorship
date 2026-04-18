@@ -993,9 +993,11 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     //
     // TODO: revisit reading-mode support in a future release.
 
-    console.log(
-      `AiStyled-Authorship: loaded (${Platform.isMobile ? "mobile" : "desktop"})`
-    );
+    if (getConfig().debug) {
+      console.log(
+        `AiStyled-Authorship: loaded (${Platform.isMobile ? "mobile" : "desktop"})`
+      );
+    }
   }
 
   private async runPasteWithAI(editor: Editor) {
@@ -1517,7 +1519,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
           // skip individual file errors
         }
       }
-      if (copied > 0) {
+      if (copied > 0 && getConfig().debug) {
         console.log(
           `AiStyled-Authorship: copied ${copied} sidecar(s) from ${src}/ to ${dst}/`
         );
@@ -1606,7 +1608,9 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     for (const [, id] of this.writeTimers) window.clearTimeout(id);
     this.writeTimers.clear();
     document.body.classList.remove("leftcoast-ai-disabled");
-    console.log("AiStyled-Authorship: unloaded");
+    if (getConfig().debug) {
+      console.log("AiStyled-Authorship: unloaded");
+    }
   }
 }
 
@@ -1938,81 +1942,10 @@ class AuthorshipSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
-  private detectSyncConfig(): {
-    syncEnabled: boolean;
-    otherTypesEnabled: boolean | null;
-  } {
-    try {
-      // @ts-ignore — internal Obsidian API
-      const syncPlugin = this.plugin.app.internalPlugins?.getPluginById?.("sync");
-      if (!syncPlugin?.enabled) {
-        console.warn("[AiStyled SYNC] sync plugin not enabled");
-        return { syncEnabled: false, otherTypesEnabled: null };
-      }
-      // @ts-ignore
-      const instance = syncPlugin.instance;
-      console.warn("[AiStyled SYNC] sync plugin instance:", instance);
-      console.warn("[AiStyled SYNC] instance keys:", instance ? Object.keys(instance) : "(none)");
-
-      // Dump any object-typed config-ish property so we can see what's there
-      const candidatePaths = [
-        "pluginsMode", "syncOptions", "config", "options", "syncBinaries",
-        "syncAttachments", "binaries", "other", "otherTypes", "types",
-        "syncOtherFiles",
-      ];
-      for (const key of candidatePaths) {
-        // @ts-ignore
-        const val = instance?.[key];
-        if (val !== undefined) {
-          console.warn(`[AiStyled SYNC] instance.${key} =`, val);
-        }
-      }
-
-      // Try shallow direct property (sync config is often flat)
-      const directKeys = [
-        "syncBinaries", "syncOtherFiles", "syncAttachments", "syncOther",
-        "otherTypes", "allOther",
-      ];
-      for (const k of directKeys) {
-        // @ts-ignore
-        if (instance?.[k] !== undefined) {
-          // @ts-ignore
-          const v = !!instance[k];
-          console.warn(`[AiStyled SYNC] detected direct ${k} =`, v);
-          return { syncEnabled: true, otherTypesEnabled: v };
-        }
-      }
-
-      // Try nested under common config objects
-      const nestedContainers = [
-        instance?.pluginsMode,
-        instance?.syncOptions,
-        instance?.config,
-        instance?.options,
-      ];
-      const nestedKeys = [
-        "syncBinaries", "syncOtherFiles", "syncAttachments", "binaries",
-        "other", "otherTypes",
-      ];
-      for (const obj of nestedContainers) {
-        if (obj && typeof obj === "object") {
-          for (const k of nestedKeys) {
-            if (k in obj) {
-              const v = !!obj[k];
-              console.warn(`[AiStyled SYNC] detected nested ${k} =`, v);
-              return { syncEnabled: true, otherTypesEnabled: v };
-            }
-          }
-        }
-      }
-
-      console.warn("[AiStyled SYNC] could not detect other-types setting");
-      return { syncEnabled: true, otherTypesEnabled: null };
-    } catch (err) {
-      console.warn("[AiStyled SYNC] detect error:", err);
-      return { syncEnabled: false, otherTypesEnabled: null };
-    }
-  }
+  // Sync configuration detection was removed in 0.2.6 because it relied on
+  // app.internalPlugins — an unsupported private API that blocks community
+  // plugin submission. The settings UI now shows a single unconditional
+  // setup note instead of trying to personalize it based on detected state.
 
   private isSidecarFolderHidden(): boolean {
     try {
@@ -2044,15 +1977,12 @@ class AuthorshipSettingTab extends PluginSettingTab {
   private renderInstallationInstructions() {
     const { containerEl } = this;
     const usingDataJson = this.plugin.settings.storageBackend === "dataJson";
-    const { syncEnabled, otherTypesEnabled } = this.detectSyncConfig();
     const folderHidden = this.isSidecarFolderHidden();
-    // When using data.json backend, sidecar-specific setup is N/A: no folder
-    // to hide, no sync-type verification needed. Only the style-commands
-    // section remains relevant.
-    const syncProblem = usingDataJson
-      ? false
-      : syncEnabled && otherTypesEnabled === false;
-    const setupComplete = usingDataJson ? true : folderHidden && !syncProblem;
+    // Setup is "complete" when the sidecar folder is hidden (data.json
+    // backend has no sidecar folder, so it is always complete). Sync
+    // configuration can't be auto-detected without private API, so the
+    // sync section now just gives unconditional guidance.
+    const setupComplete = usingDataJson ? true : folderHidden;
 
     const details = containerEl.createEl("details");
     if (!setupComplete) details.setAttr("open", "");
@@ -2081,7 +2011,7 @@ class AuthorshipSettingTab extends PluginSettingTab {
 
     if (!usingDataJson) {
       this.renderHideFolderSection(body, folderHidden);
-      this.renderSyncSetupSection(body, syncEnabled, otherTypesEnabled);
+      this.renderSyncSetupSection(body);
     }
     this.renderStyleCommandsSection(body);
   }
@@ -2126,53 +2056,23 @@ class AuthorshipSettingTab extends PluginSettingTab {
     }
   }
 
-  private renderSyncSetupSection(
-    parent: HTMLElement,
-    syncEnabled: boolean,
-    otherTypesEnabled: boolean | null
-  ) {
+  private renderSyncSetupSection(parent: HTMLElement) {
     const section = parent.createDiv();
     section.setAttr("style", "margin-bottom: 16px;");
 
     const h = section.createEl("h4");
     h.setAttr("style", "margin: 10px 0 6px 0;");
+    h.setText("2. Sync setup (if you use cross-device sync)");
 
     const p = section.createEl("p");
     p.setAttr("style", "margin: 0; font-size: 0.9em;");
-
-    if (!syncEnabled) {
-      h.setText("2. Sync setup");
-      p.setText(
-        "Obsidian Sync doesn't appear to be running. If you use iCloud Drive, Dropbox, or another " +
-        "vault sync tool, the z-author-sync/ folder will sync automatically as part of your vault. " +
-        "If you plan to use Obsidian Sync, enable \"Sync all other file types\" in " +
-        "Settings → Core plugins → Sync on every device after you turn it on."
-      );
-    } else if (otherTypesEnabled === true) {
-      h.setText("2. Sync setup ✓");
-      p.setText(
-        "Obsidian Sync is running and \"Sync all other file types\" is on. " +
-        "Styling will sync across devices."
-      );
-    } else if (otherTypesEnabled === false) {
-      h.setText("2. Enable \"Sync all other file types\"");
-      p.setAttr(
-        "style",
-        "margin: 0; font-size: 0.9em; color: var(--text-error);"
-      );
-      p.setText(
-        "Obsidian Sync is running, but \"Sync all other file types\" appears to be off. " +
-        "Without it, the z-author-sync/ folder won't sync. " +
-        "Enable it in Settings → Core plugins → Sync — on every device."
-      );
-    } else {
-      h.setText("2. Verify \"Sync all other file types\"");
-      p.setText(
-        "Obsidian Sync is running, but I can't detect whether \"Sync all other file types\" is on. " +
-        "For styling to sync across devices, make sure that setting is enabled in " +
-        "Settings → Core plugins → Sync."
-      );
-    }
+    p.setText(
+      "AI styling data lives in a z-author-sync/ folder at your vault root. " +
+      "For the styling to follow you across devices, whatever vault-sync tool you use must sync that folder. " +
+      "If you use iCloud Drive, Dropbox, Syncthing, or any filesystem-level sync, this works automatically. " +
+      "If you use Obsidian Sync, enable \"Sync all other file types\" in " +
+      "Settings → Core plugins → Sync on every device."
+    );
   }
 
   private renderStyleCommandsSection(parent: HTMLElement) {

@@ -1,6 +1,6 @@
 {
   "name": "aistyled-authorship",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "iA Writer-style per-character AI authorship tracking for Obsidian.",
   "main": "main.js",
   "scripts": {
@@ -12,7 +12,10 @@
     "authorship",
     "ai"
   ],
-  "author": "Leftcoast",
+  "author": {
+    "name": "Leviathan Duck — Leftcoast Media House Inc.",
+    "url": "https://github.com/LeviathanDuck"
+  },
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
