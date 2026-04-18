@@ -1,26 +1,50 @@
 import {
+  AbstractInputSuggest,
   App,
   Editor,
   MarkdownView,
   Menu,
+  Modal,
   Notice,
   Platform,
   Plugin,
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
+  debounce,
   normalizePath,
-  type DataAdapter,
+  prepareFuzzySearch,
+  renderMatches,
 } from "obsidian";
 import { EditorView, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from "@codemirror/view";
 import { RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
 
-// ---- types ----
+import {
+  AIRange,
+  DATA_JSON_SIZE_CAP_BYTES,
+  DATA_JSON_WARN_THRESHOLD,
+  DEFAULT_AUTHOR,
+  RangeEvent,
+  authorOf,
+  diffRangeSets,
+  generateDeviceId,
+  mergeRange,
+  normalizeRanges,
+  sameRanges,
+  subtractInterval,
+} from "./src/schema";
+import {
+  CacheSize,
+  DataJsonStorage,
+  SidecarStorage,
+  StorageBackend,
+  encodeSidecarPath,
+} from "./src/storage";
+import { ConflictScanner } from "./src/conflict";
 
-interface AIRange {
-  from: number;
-  to: number;
-}
+export type { AIRange };
+
 
 interface RGB {
   r: number;
@@ -55,12 +79,6 @@ interface GradientConfig {
   debug: boolean;
 }
 
-interface SidecarData {
-  version: number;
-  file: string;
-  ranges: { from: number; to: number; author: "ai" }[];
-}
-
 // ---- settings ----
 
 type GradientOrientation = "vertical" | "horizontal";
@@ -75,6 +93,23 @@ interface AuthorshipSettings {
   waviness: number; // 0.0 = flat, 1.0 = default, 2.0 = strong
   showInReadingMode: boolean;
   debug: boolean;
+  // Vault-relative path for the sidecar folder. Defaults to SIDECAR_FOLDER.
+  sidecarFolderPath: string;
+  // Previous path stashed when the user changes sidecarFolderPath, so the
+  // "Migrate data now" button and the load-time backstop know where old
+  // data lives. null when there is nothing to migrate.
+  previousSidecarFolderPath: string | null;
+  // v0.2: storage backend selection. "sidecar" = one JSON file per note
+  // in the configured folder (default; recommended for sync robustness).
+  // "dataJson" = all records in the plugin's own data.json.
+  storageBackend: "sidecar" | "dataJson";
+  // Stable identifier for this device, embedded in every event so
+  // multi-device merges can resolve LWW deterministically. Generated
+  // on first run; user-regenerable from settings for vault clones.
+  deviceId: string;
+  // Optional human-readable label (e.g. "MacBook Pro"). Not currently
+  // surfaced; reserved for future per-device color/legend UI.
+  deviceLabel: string;
 }
 
 const DEFAULT_SETTINGS: AuthorshipSettings = {
@@ -93,6 +128,11 @@ const DEFAULT_SETTINGS: AuthorshipSettings = {
   waviness: 1.0,
   showInReadingMode: false,
   debug: false,
+  sidecarFolderPath: "z-author-sync",
+  previousSidecarFolderPath: null,
+  storageBackend: "sidecar",
+  deviceId: "",
+  deviceLabel: "",
 };
 
 // ---- state effects & field ----
@@ -108,17 +148,18 @@ const aiRangeField = StateField.define<AIRange[]>({
     // Step 1: map each existing range through the change set.
     // side=1 at `from` and side=-1 at `to` keeps insertions at the
     // boundaries OUTSIDE the range (new chars typed adjacent stay normal).
+    // Author is preserved across mapping.
     let next: AIRange[] = [];
     for (const range of ranges) {
       const from = tr.changes.mapPos(range.from, 1);
       const to = tr.changes.mapPos(range.to, -1);
-      if (to > from) next.push({ from, to });
+      if (to > from) next.push({ from, to, author: authorOf(range) });
     }
 
     // Step 2: subtract every inserted/replaced region from all ranges.
     // This is what keeps "typing inside an AI range produces normal chars"
-    // working. Any new characters carved out by changes become un-tagged.
-    // `addAIRange` effects (step 3) re-add tagging for deliberate AI pastes.
+    // working. No targetAuthor → strips coverage from all authors at the
+    // typed location (typed chars belong to nobody until v0.3 capture mode).
     tr.changes.iterChanges((_fromA, _toA, fromB, toB) => {
       if (toB <= fromB) return; // pure deletion, handled by mapPos above
       next = subtractInterval(next, fromB, toB);
@@ -131,7 +172,9 @@ const aiRangeField = StateField.define<AIRange[]>({
       } else if (effect.is(replaceAIRanges)) {
         next = normalizeRanges(effect.value);
       } else if (effect.is(clearAIRange)) {
-        next = subtractInterval(next, effect.value.from, effect.value.to);
+        // Per-author clear when author is specified, universal otherwise.
+        // v0.2 always specifies "ai" (default); v0.3 may use other authors.
+        next = subtractInterval(next, effect.value.from, effect.value.to, authorOf(effect.value));
       }
     }
 
@@ -142,36 +185,11 @@ const aiRangeField = StateField.define<AIRange[]>({
 });
 
 // ---- range helpers ----
-
-function mergeRange(ranges: AIRange[], incoming: AIRange): AIRange[] {
-  const all = [...ranges, incoming].sort((a, b) => a.from - b.from);
-  const merged: AIRange[] = [];
-
-  for (const range of all) {
-    const last = merged[merged.length - 1];
-    if (last && range.from <= last.to) {
-      last.to = Math.max(last.to, range.to);
-    } else {
-      merged.push({ ...range });
-    }
-  }
-
-  return merged;
-}
-
-function subtractInterval(ranges: AIRange[], excFrom: number, excTo: number): AIRange[] {
-  if (excTo <= excFrom) return ranges;
-  const result: AIRange[] = [];
-  for (const seg of ranges) {
-    if (seg.to <= excFrom || seg.from >= excTo) {
-      result.push(seg);
-    } else {
-      if (seg.from < excFrom) result.push({ from: seg.from, to: excFrom });
-      if (seg.to > excTo) result.push({ from: excTo, to: seg.to });
-    }
-  }
-  return result;
-}
+//
+// mergeRange / subtractInterval / normalizeRanges / sameRanges live in
+// src/schema.ts and are imported above. They are author-aware: ranges
+// with different authors never merge into one another. v0.2 always
+// uses "ai" so behavior is identical to v0.1.
 
 function selectionOverlapsAI(view: EditorView, selFrom: number, selTo: number): boolean {
   if (selTo <= selFrom) return false;
@@ -196,23 +214,6 @@ function selectionFullyAI(view: EditorView, selFrom: number, selTo: number): boo
   return cursor >= selTo;
 }
 
-function normalizeRanges(ranges: AIRange[]): AIRange[] {
-  let next: AIRange[] = [];
-  for (const range of ranges) {
-    if (!range || range.to <= range.from) continue;
-    next = mergeRange(next, { from: range.from, to: range.to });
-  }
-  return next;
-}
-
-function sameRanges(a: AIRange[], b: AIRange[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].from !== b[i].from || a[i].to !== b[i].to) return false;
-  }
-  return true;
-}
-
 // ---- sidecar I/O ----
 
 // Sidecars live in a visible `z-author-sync/` folder at the vault root.
@@ -223,7 +224,7 @@ const PLUGIN_ID = "aistyled-authorship";
 const SIDECAR_FOLDER = "z-author-sync";
 const LEGACY_DOT_FOLDER = ".authorship";
 const LEGACY_VAULT_ROOT_FOLDER = "authorship";
-const SIDECAR_VERSION = 1;
+// SIDECAR_VERSION removed in v0.2 — schema versions are owned by src/schema.ts.
 
 const SIDECAR_README_FILENAME = "README.md";
 const SIDECAR_README_BODY = `# AI Styled Authorship — sync data
@@ -290,88 +291,9 @@ sight, use one of the hide options above instead.
 *Created and maintained by the AI Styled Authorship plugin.*
 `;
 
-function encodeSidecarPath(folder: string, notePath: string): string {
-  const encoded = notePath.replace(/\//g, "__");
-  return normalizePath(`${folder}/${encoded}.json`);
-}
-
-async function readSidecar(adapter: DataAdapter, sidecarPath: string): Promise<AIRange[]> {
-  try {
-    if (!(await adapter.exists(sidecarPath))) return [];
-    const raw = await adapter.read(sidecarPath);
-    const data = JSON.parse(raw) as Partial<SidecarData>;
-    if (!data || !Array.isArray(data.ranges)) return [];
-    const ranges: AIRange[] = [];
-    for (const r of data.ranges) {
-      if (r && typeof r.from === "number" && typeof r.to === "number" && r.to > r.from) {
-        ranges.push({ from: r.from, to: r.to });
-      }
-    }
-    return normalizeRanges(ranges);
-  } catch (err) {
-    console.warn(`AiStyled-Authorship: failed to read sidecar ${sidecarPath}`, err);
-    return [];
-  }
-}
-
-async function writeSidecar(
-  adapter: DataAdapter,
-  folder: string,
-  sidecarPath: string,
-  notePath: string,
-  ranges: AIRange[]
-): Promise<void> {
-  try {
-    if (ranges.length === 0) {
-      console.warn("[AiStyled WRITE] ranges empty → skipping (never write empty)");
-      return;
-    }
-    if (!(await adapter.exists(folder))) {
-      console.warn("[AiStyled WRITE] creating sidecar folder:", folder);
-      await adapter.mkdir(folder);
-    }
-    const data: SidecarData = {
-      version: SIDECAR_VERSION,
-      file: notePath,
-      ranges: ranges.map(r => ({ from: r.from, to: r.to, author: "ai" as const })),
-    };
-    const json = JSON.stringify(data, null, 2);
-    console.warn("[AiStyled WRITE] writing", sidecarPath, "→", json.length, "bytes,", ranges.length, "ranges");
-    await adapter.write(sidecarPath, json);
-    console.warn("[AiStyled WRITE] ✓ write succeeded:", sidecarPath);
-  } catch (err) {
-    console.warn("[AiStyled WRITE] ✗ write FAILED:", sidecarPath, err);
-  }
-}
-
-async function deleteSidecar(adapter: DataAdapter, sidecarPath: string): Promise<void> {
-  try {
-    if (await adapter.exists(sidecarPath)) {
-      await adapter.remove(sidecarPath);
-    }
-  } catch (err) {
-    console.warn(`AiStyled-Authorship: failed to delete sidecar ${sidecarPath}`, err);
-  }
-}
-
-async function moveSidecar(
-  adapter: DataAdapter,
-  folder: string,
-  fromPath: string,
-  toPath: string
-): Promise<void> {
-  try {
-    if (!(await adapter.exists(fromPath))) return;
-    const raw = await adapter.read(fromPath);
-    if (!(await adapter.exists(folder))) {
-      await adapter.mkdir(folder);
-    }
-    await adapter.write(toPath, raw);
-    await adapter.remove(fromPath);
-  } catch (err) {
-    console.warn(`AiStyled-Authorship: failed to move sidecar ${fromPath} -> ${toPath}`, err);
-  }
-}
+// Sidecar I/O is delegated to the StorageBackend (src/storage.ts).
+// The path encoder lives there too and is imported above so existing
+// references to encodeSidecarPath continue to work unchanged.
 
 // ---- gradient rendering ----
 
@@ -856,8 +778,17 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
   private hydrated: Set<string> = new Set();
   settings: AuthorshipSettings = { ...DEFAULT_SETTINGS };
 
+  // v0.2 storage layer
+  backend!: StorageBackend;
+  conflictScanner!: ConflictScanner;
+  // Per-session "approaching cap" warning latch — one Notice per session.
+  private warnedNearCap = false;
+
   async onload() {
     await this.loadSettings();
+    await this.ensureDeviceId();
+    this.backend = this.buildBackend();
+    this.conflictScanner = this.buildConflictScanner();
 
     this.registerEditorExtension([
       aiRangeField,
@@ -971,17 +902,11 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       if (active) void this.hydrateFile(active);
     });
 
-    // Rename hook — move the sidecar with the note
+    // Rename hook — relocate the stored record alongside the note
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         if (file instanceof TFile) {
-          const folder = this.sidecarFolder;
-          void moveSidecar(
-            this.app.vault.adapter,
-            folder,
-            encodeSidecarPath(folder, oldPath),
-            encodeSidecarPath(folder, file.path)
-          );
+          void this.backend.rename(oldPath, file.path);
           const cached = this.lastPersisted.get(oldPath);
           if (cached) {
             this.lastPersisted.set(file.path, cached);
@@ -995,20 +920,29 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       })
     );
 
-    // Sidecar arrived via sync — merge its ranges with the current editor
-    // state (union). This way ranges from other devices are ADDED to this
-    // device's ranges, not replace-or-skip. Supports multi-device editing
-    // where each device adds its own AI styling.
+    // Sidecar arrived via sync — merge its ranges into the current
+    // editor state (union of folded ranges). Also opportunistically
+    // checks if the touched file is a sync-conflict copy and merges
+    // it into the canonical sidecar. Skipped entirely under the
+    // dataJson backend (sidecar folder is not in use).
     const onSidecarTouched = (filePath: string) => {
-      if (!filePath.startsWith(SIDECAR_FOLDER + "/")) return;
-      const filename = filePath.slice(SIDECAR_FOLDER.length + 1);
+      const folder = this.backend.sidecarFolder();
+      if (!folder) return;
+      if (!filePath.startsWith(folder + "/")) return;
+      const filename = filePath.slice(folder.length + 1);
       if (filename === SIDECAR_README_FILENAME) return;
       if (!filename.endsWith(".json")) return;
-      const encoded = filename.slice(0, -5);
-      const notePath = encoded.replace(/__/g, "/");
-      const noteFile = this.app.vault.getAbstractFileByPath(notePath);
-      if (!(noteFile instanceof TFile)) return;
-      void this.mergeSidecarIntoView(noteFile);
+
+      // First, try to resolve as a conflict copy.
+      void this.conflictScanner.scanPath(filePath).then(merged => {
+        if (merged) return;
+        // Not a conflict — treat as a canonical sidecar update.
+        const encoded = filename.slice(0, -5);
+        const notePath = encoded.replace(/__/g, "/");
+        const noteFile = this.app.vault.getAbstractFileByPath(notePath);
+        if (!(noteFile instanceof TFile)) return;
+        void this.mergeSidecarIntoView(noteFile);
+      });
     };
     this.registerEvent(
       this.app.vault.on("create", file => {
@@ -1021,11 +955,11 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       })
     );
 
-    // Delete hook — drop the sidecar
+    // Delete hook — drop the stored record
     this.registerEvent(
       this.app.vault.on("delete", file => {
         if (file instanceof TFile) {
-          void deleteSidecar(this.app.vault.adapter, encodeSidecarPath(this.sidecarFolder, file.path));
+          void this.backend.delete(file.path);
           this.lastPersisted.delete(file.path);
           this.hydrated.delete(file.path);
           const pending = this.writeTimers.get(file.path);
@@ -1036,6 +970,18 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
         }
       })
     );
+
+    // App-focus rescan — catches conflict copies that arrived while
+    // the window was in the background.
+    this.registerDomEvent(window, "focus", () => {
+      void this.conflictScanner.scanAll();
+    });
+
+    // Initial conflict sweep on startup. Runs in the background; if it
+    // finds anything it triggers per-note merges via onMerged.
+    this.app.workspace.onLayoutReady(() => {
+      void this.conflictScanner.scanAll();
+    });
 
     // Reading-mode post-processor: DISABLED for now. The gradient treatment
     // in Obsidian's reading-mode renderer requires deeper understanding of
@@ -1228,11 +1174,20 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     });
   }
 
+  // Re-hydrates ALL open markdown editors from the backend. Used after
+  // a backend switch or after a destructive cache delete so the visible
+  // gradient state matches what's now in storage.
+  async rehydrateAllOpen(): Promise<void> {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file) {
+        await this.hydrateFile(view.file);
+      }
+    }
+  }
+
   private async mergeSidecarIntoView(file: TFile) {
-    const ranges = await readSidecar(
-      this.app.vault.adapter,
-      encodeSidecarPath(this.sidecarFolder, file.path)
-    );
+    const { ranges } = await this.backend.load(file.path);
     if (ranges.length === 0) return;
 
     const view = this.findEditorView(file);
@@ -1265,7 +1220,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
   private async hydrateFile(file: TFile, attempt = 0) {
     console.warn("[AiStyled HYDRATE] hydrateFile:", file.path, "attempt:", attempt);
     // Don't block on `hydrated` — that set gates WRITES only (in
-    // onRangesMaybeChanged). We always attempt to load from the sidecar
+    // onRangesMaybeChanged). We always attempt to load from the backend
     // when the editor's field is empty, even if we've hydrated before,
     // because CM6 creates a fresh empty state when the user switches
     // away and back.
@@ -1284,22 +1239,19 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
       return;
     }
 
-    const ranges = await readSidecar(
-      this.app.vault.adapter,
-      encodeSidecarPath(this.sidecarFolder, file.path)
-    );
+    const { ranges } = await this.backend.load(file.path);
 
     if (ranges.length === 0) {
-      // No sidecar. Mark hydrated — writes are allowed if the user adds
+      // No record. Mark hydrated — writes are allowed if the user adds
       // ranges later.
       this.hydrated.add(file.path);
       return;
     }
 
     const current = view.state.field(aiRangeField, false) ?? [];
-    // Union: keep whatever the editor already has AND add the sidecar's
-    // ranges. Handles multi-device case where the local state might have
-    // been populated by earlier sync events or a previous session.
+    // Union: keep whatever the editor already has AND add the loaded
+    // ranges. Handles multi-device case where the local state might
+    // have been populated by earlier sync events or a previous session.
     const merged = normalizeRanges([...current, ...ranges]);
 
     if (sameRanges(current, merged)) {
@@ -1351,51 +1303,157 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     const normalized = normalizeRanges(ranges);
     console.warn("[AiStyled PERSIST] → ranges count:", normalized.length, "hydrated:", this.hydrated.has(path));
 
-    // Never write empty ranges. An empty field is usually a transient state
-    // (editor just created, hydration pending). Writing [] would delete the
-    // sidecar and race with hydration. Sidecars are only deleted when the
-    // NOTE is deleted (vault delete hook), not when the field is empty.
-    if (normalized.length === 0) {
-      console.warn("[AiStyled PERSIST] → skipped: empty ranges (never write empty)");
-      return;
-    }
-
+    // Empty ranges are still meaningful in v0.2: they represent "user
+    // removed the last AI range" and should be persisted as remove
+    // events. We rely on the diff against lastPersisted to figure out
+    // whether anything actually changed.
     if (!this.hydrated.has(path)) {
+      // Pre-hydration writes are unsafe — we'd diff against an empty
+      // baseline and emit spurious add events for ranges that already
+      // exist on disk. Mark hydrated only after a non-empty write or
+      // an explicit hydrate.
+      if (normalized.length === 0) {
+        console.warn("[AiStyled PERSIST] → skipped: pre-hydration + empty");
+        return;
+      }
       console.warn("[AiStyled PERSIST] → marking hydrated (non-empty write)");
       this.hydrated.add(path);
     }
 
-    const last = this.lastPersisted.get(path);
-    if (last && sameRanges(last, normalized)) {
+    const last = this.lastPersisted.get(path) ?? [];
+    if (sameRanges(last, normalized)) {
       console.warn("[AiStyled PERSIST] → skipped: same as lastPersisted");
       return;
     }
-    console.warn("[AiStyled PERSIST] → scheduling sidecar write for", path, "with", normalized.length, "ranges");
-    this.scheduleSidecarWrite(path, normalized);
+    console.warn("[AiStyled PERSIST] → scheduling write for", path, "with", normalized.length, "ranges");
+    this.scheduleWrite(path, last, normalized);
   }
 
-  private scheduleSidecarWrite(notePath: string, ranges: AIRange[]) {
+  private scheduleWrite(notePath: string, previous: AIRange[], current: AIRange[]) {
     const existing = this.writeTimers.get(notePath);
     if (existing !== undefined) window.clearTimeout(existing);
     const timerId = window.setTimeout(() => {
       this.writeTimers.delete(notePath);
-      console.warn("[AiStyled PERSIST] debounce fired for", notePath, "→ flushing", ranges.length, "ranges");
-      void this.flushSidecar(notePath, ranges);
+      console.warn("[AiStyled PERSIST] debounce fired for", notePath);
+      void this.flushWrite(notePath, previous, current);
     }, WRITE_DEBOUNCE_MS);
     this.writeTimers.set(notePath, timerId);
   }
 
-  private async flushSidecar(notePath: string, ranges: AIRange[]) {
-    const folder = this.sidecarFolder;
-    const sidecarPath = encodeSidecarPath(folder, notePath);
-    console.warn("[AiStyled PERSIST] flushSidecar:", sidecarPath, "ranges:", ranges.length);
-    await writeSidecar(this.app.vault.adapter, folder, sidecarPath, notePath, ranges);
-    console.warn("[AiStyled PERSIST] writeSidecar completed for", sidecarPath);
-    this.lastPersisted.set(notePath, ranges);
+  private async flushWrite(notePath: string, previous: AIRange[], current: AIRange[]) {
+    // Re-snapshot lastPersisted at flush time — it may have advanced
+    // (e.g. via mergeSidecarIntoView from a sync event).
+    const baseline = this.lastPersisted.get(notePath) ?? previous;
+    const events = diffRangeSets(baseline, current, {
+      ts: Date.now(),
+      deviceId: this.settings.deviceId,
+    });
+    if (events.length === 0) {
+      console.warn("[AiStyled PERSIST] → no events to write");
+      this.lastPersisted.set(notePath, current);
+      return;
+    }
+    console.warn("[AiStyled PERSIST] → appending", events.length, "events for", notePath);
+    const result = await this.backend.appendEvents(notePath, events);
+    if (result.exceededCap) {
+      new Notice(
+        "AI Authorship cache exceeded sync size limit (3.8 MB). " +
+        "Latest changes were not saved. Delete unused entries via Settings."
+      );
+      return;
+    }
+    if (result.aggressivelyCompacted) {
+      console.warn("[AiStyled PERSIST] → aggressive compaction triggered for", notePath);
+    }
+    if (
+      result.bytes >= DATA_JSON_WARN_THRESHOLD &&
+      result.bytes < DATA_JSON_SIZE_CAP_BYTES &&
+      !this.warnedNearCap
+    ) {
+      this.warnedNearCap = true;
+      new Notice(
+        `AI Authorship cache approaching the sync size limit (~${Math.round(
+          (result.bytes / DATA_JSON_SIZE_CAP_BYTES) * 100,
+        )}%). Consider deleting unused entries.`,
+      );
+    }
+    this.lastPersisted.set(notePath, current);
   }
 
   private get sidecarFolder(): string {
-    return SIDECAR_FOLDER;
+    const configured = this.settings?.sidecarFolderPath?.trim();
+    return normalizePath(configured || SIDECAR_FOLDER);
+  }
+
+  // ---- backend construction & lifecycle ----
+
+  private buildBackend(): StorageBackend {
+    if (this.settings.storageBackend === "dataJson") {
+      return new DataJsonStorage(this);
+    }
+    return new SidecarStorage(this.app.vault.adapter, () => this.sidecarFolder);
+  }
+
+  private buildConflictScanner(): ConflictScanner {
+    return new ConflictScanner(
+      this.app.vault.adapter,
+      () => this.backend.sidecarFolder(),
+      (notePath: string) => {
+        const file = this.app.vault.getAbstractFileByPath(notePath);
+        if (file instanceof TFile) void this.mergeSidecarIntoView(file);
+      },
+    );
+  }
+
+  // Public proxy used by settings UI's Regenerate button.
+  async ensureDeviceIdPublic(): Promise<void> {
+    await this.ensureDeviceId();
+  }
+
+  // First-run device-ID generation. Persists to settings only when
+  // empty so existing IDs survive across loads.
+  private async ensureDeviceId(): Promise<void> {
+    if (this.settings.deviceId && this.settings.deviceId.length > 0) return;
+    const hint =
+      // @ts-ignore — Obsidian internal/Electron-only on desktop
+      (typeof require === "function" && (() => {
+        try {
+          // @ts-ignore
+          return require("os").hostname();
+        } catch {
+          return "device";
+        }
+      })()) || "device";
+    this.settings.deviceId = generateDeviceId(hint);
+    await this.saveSettings();
+  }
+
+  // Called from settings when the user switches backend OR when the
+  // sidecar folder path changes. Migrates records from the old backend
+  // into the new one (per-record, so partial failure is recoverable),
+  // then refreshes open editors.
+  async reinitBackend(previousBackend?: StorageBackend): Promise<{ migrated: number }> {
+    const oldBackend = previousBackend ?? this.backend;
+    const newBackend = this.buildBackend();
+    let migrated = 0;
+    try {
+      const paths = await oldBackend.listAll();
+      for (const notePath of paths) {
+        const { raw } = await oldBackend.load(notePath);
+        if (!raw) continue;
+        const result = await newBackend.putRecord(notePath, raw);
+        if (result.written) migrated++;
+      }
+    } catch (err) {
+      console.warn("AiStyled-Authorship: backend migration encountered error", err);
+    }
+    this.backend = newBackend;
+    this.conflictScanner = this.buildConflictScanner();
+    this.lastPersisted.clear();
+    this.hydrated.clear();
+    this.warnedNearCap = false;
+    await this.rehydrateAllOpen();
+    return { migrated };
   }
 
   private get pluginFolderSidecarPath(): string {
@@ -1412,49 +1470,82 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     //   .authorship/                             -> z-author-sync/   (very old)
     //   authorship/                              -> z-author-sync/   (0.1.9)
     //   <configDir>/plugins/<id>/authorship/     -> z-author-sync/   (0.1.8)
-    const adapter = this.app.vault.adapter;
+    //   previousSidecarFolderPath                -> current          (user-configured)
     const target = this.sidecarFolder;
     const legacyLocations = [
       LEGACY_DOT_FOLDER,
       LEGACY_VAULT_ROOT_FOLDER,
       this.pluginFolderSidecarPath,
     ];
+    const previous = this.settings?.previousSidecarFolderPath;
+    if (previous && normalizePath(previous) !== target) {
+      legacyLocations.push(normalizePath(previous));
+    }
 
     for (const src of legacyLocations) {
-      try {
-        if (!(await adapter.exists(src))) continue;
-        const listing = await adapter.list(src);
-        if (listing.files.length === 0) continue;
-        if (!(await adapter.exists(target))) {
-          await adapter.mkdir(target);
-        }
-        let copied = 0;
-        for (const oldPath of listing.files) {
-          const filename = oldPath.split("/").pop();
-          if (!filename) continue;
-          // Never migrate the README from an old location.
-          if (filename === SIDECAR_README_FILENAME) continue;
-          const newPath = normalizePath(`${target}/${filename}`);
-          try {
-            if (await adapter.exists(newPath)) continue;
-            const content = await adapter.read(oldPath);
-            await adapter.write(newPath, content);
-            copied++;
-          } catch {
-            // skip individual file errors
-          }
-        }
-        if (copied > 0) {
-          console.log(
-            `AiStyled-Authorship: copied ${copied} sidecar(s) from ${src}/ to ${target}/`
-          );
-        }
-      } catch (err) {
-        console.warn(`AiStyled-Authorship: sidecar migration from ${src}/ failed`, err);
-      }
+      await this.copySidecarsBetween(src, target);
     }
 
     await this.ensureSidecarReadme();
+  }
+
+  // Copies every sidecar file from src/ to dst/. Never moves; never
+  // overwrites. Returns the number of files copied. Skips the sidecar
+  // README from the source (it is regenerated in the target by
+  // ensureSidecarReadme). No-op when src does not exist or is empty.
+  async copySidecarsBetween(src: string, dst: string): Promise<number> {
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!(await adapter.exists(src))) return 0;
+      const listing = await adapter.list(src);
+      if (listing.files.length === 0) return 0;
+      if (!(await adapter.exists(dst))) {
+        await adapter.mkdir(dst);
+      }
+      let copied = 0;
+      for (const oldPath of listing.files) {
+        const filename = oldPath.split("/").pop();
+        if (!filename) continue;
+        if (filename === SIDECAR_README_FILENAME) continue;
+        const newPath = normalizePath(`${dst}/${filename}`);
+        try {
+          if (await adapter.exists(newPath)) continue;
+          const content = await adapter.read(oldPath);
+          await adapter.write(newPath, content);
+          copied++;
+        } catch {
+          // skip individual file errors
+        }
+      }
+      if (copied > 0) {
+        console.log(
+          `AiStyled-Authorship: copied ${copied} sidecar(s) from ${src}/ to ${dst}/`
+        );
+      }
+      return copied;
+    } catch (err) {
+      console.warn(`AiStyled-Authorship: sidecar copy from ${src}/ failed`, err);
+      return 0;
+    }
+  }
+
+  // Counts sidecar files at a given folder (excluding README). Used by
+  // the settings UI to decide whether to show the migration banner.
+  async countSidecarsAt(folder: string): Promise<number> {
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!(await adapter.exists(folder))) return 0;
+      const listing = await adapter.list(folder);
+      let n = 0;
+      for (const p of listing.files) {
+        const filename = p.split("/").pop();
+        if (!filename || filename === SIDECAR_README_FILENAME) continue;
+        n++;
+      }
+      return n;
+    } catch {
+      return 0;
+    }
   }
 
   private async ensureSidecarReadme() {
@@ -1516,6 +1607,170 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     this.writeTimers.clear();
     document.body.classList.remove("leftcoast-ai-disabled");
     console.log("AiStyled-Authorship: unloaded");
+  }
+}
+
+// ---- formatting helpers ----
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+// ---- delete-cache confirmation modal ----
+
+class DeleteCacheModal extends Modal {
+  constructor(
+    app: App,
+    private plugin: LeftcoastAuthorshipPlugin,
+    private size: CacheSize,
+    private onAfter: () => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl, titleEl } = this;
+    titleEl.setText("Delete all AI authorship cache?");
+
+    const intro = contentEl.createEl("p");
+    intro.appendText(
+      `This will permanently delete all stored AI authorship ranges across `,
+    );
+    intro.createEl("strong", {
+      text: `${this.size.fileCount} note${this.size.fileCount === 1 ? "" : "s"} (${formatBytes(this.size.bytes)})`,
+    });
+    intro.appendText(
+      ". The text in your notes is unchanged, but the gradient styling will " +
+        "disappear and cannot be recovered.",
+    );
+
+    const confirm = contentEl.createEl("p");
+    confirm.appendText("Type ");
+    confirm.createEl("strong", { text: "DELETE" });
+    confirm.appendText(" below to confirm. This action cannot be undone.");
+
+    const input = contentEl.createEl("input", { type: "text" });
+    input.setAttr("placeholder", "DELETE");
+    input.setAttr(
+      "style",
+      "width: 100%; margin: 0.5em 0 1em 0; padding: 6px 10px; " +
+        "border: 1px solid var(--background-modifier-border); border-radius: 6px;",
+    );
+
+    const buttons = contentEl.createDiv();
+    buttons.setAttr(
+      "style",
+      "display: flex; justify-content: flex-end; gap: 8px;",
+    );
+
+    const cancel = buttons.createEl("button", { text: "Cancel" });
+    cancel.addEventListener("click", () => this.close());
+
+    const remove = buttons.createEl("button", { text: "Delete cache" });
+    remove.setAttr(
+      "style",
+      "background: var(--background-modifier-error); color: var(--text-on-accent);",
+    );
+    remove.disabled = true;
+
+    input.addEventListener("input", () => {
+      remove.disabled =
+        input.value.trim().toUpperCase() !== "DELETE";
+    });
+
+    remove.addEventListener("click", async () => {
+      remove.disabled = true;
+      remove.setText("Deleting…");
+      try {
+        const { deleted } = await this.plugin.backend.deleteAll();
+        // Reset in-memory state so the editor doesn't re-write what we just removed.
+        // @ts-ignore — touching private fields by design
+        this.plugin["lastPersisted"].clear();
+        // @ts-ignore
+        this.plugin["hydrated"].clear();
+        // Strip ranges from open editors.
+        for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+          const view = leaf.view;
+          if (view instanceof MarkdownView) {
+            // @ts-ignore
+            const cm: EditorView | undefined = (view.editor as any)?.cm;
+            if (cm) cm.dispatch({ effects: replaceAIRanges.of([]) });
+          }
+        }
+        new Notice(`Deleted ${deleted} authorship record${deleted === 1 ? "" : "s"}.`);
+        this.close();
+        this.onAfter();
+      } catch (err) {
+        console.warn("AiStyled-Authorship: delete cache failed", err);
+        new Notice("Failed to delete cache. Check the developer console.");
+        remove.disabled = false;
+        remove.setText("Delete cache");
+      }
+    });
+
+    setTimeout(() => input.focus(), 50);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+// ---- folder-picker suggest ----
+
+// Fuzzy-searchable vault-folder picker, using the modern
+// AbstractInputSuggest API (Obsidian 1.4+). Mirrors the pattern used by
+// notebook-navigator's FolderPathInputSuggest. Opens on click as well
+// as on focus so the dropdown appears with no typed text. Caps results
+// at 100.
+class FolderSuggest extends AbstractInputSuggest<TFolder> {
+  private static readonly LIMIT = 100;
+
+  constructor(app: App, public inputEl: HTMLInputElement) {
+    super(app, inputEl);
+    inputEl.addEventListener("click", () => this.open());
+  }
+
+  getSuggestions(query: string): TFolder[] {
+    const folders: TFolder[] = [];
+    for (const f of this.app.vault.getAllLoadedFiles()) {
+      if (f instanceof TFolder) folders.push(f);
+    }
+    const trimmed = query.trim();
+    if (!trimmed) {
+      return folders
+        .sort((a, b) => a.path.localeCompare(b.path))
+        .slice(0, FolderSuggest.LIMIT);
+    }
+    const match = prepareFuzzySearch(trimmed);
+    const scored: { folder: TFolder; score: number }[] = [];
+    for (const folder of folders) {
+      const result = match(folder.path || "/");
+      if (result) scored.push({ folder, score: result.score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, FolderSuggest.LIMIT).map(s => s.folder);
+  }
+
+  renderSuggestion(folder: TFolder, el: HTMLElement): void {
+    const label = folder.path || "/";
+    const query = this.inputEl.value.trim();
+    if (query) {
+      const result = prepareFuzzySearch(query)(label);
+      if (result) {
+        renderMatches(el, label, result.matches);
+        return;
+      }
+    }
+    el.setText(label);
+  }
+
+  selectSuggestion(folder: TFolder): void {
+    this.inputEl.value = folder.path;
+    this.inputEl.dispatchEvent(new Event("input"));
+    this.close();
   }
 }
 
@@ -2050,5 +2305,325 @@ class AuthorshipSettingTab extends PluginSettingTab {
           })
       );
 
+    this.renderDataStorageSection(containerEl);
+  }
+
+  // --- Data storage section (bottom of the settings panel) ---
+
+  // In-memory dismiss marker. When the user clicks "Leave in place" we
+  // stop showing the migration banner for that specific old path until
+  // they change the setting again. Not persisted — re-appears on reload
+  // so they can still act on it.
+  private dismissedMigrationFor: string | null = null;
+
+  private renderDataStorageSection(containerEl: HTMLElement): void {
+    containerEl.createEl("h3", { text: "Data storage" });
+
+    const desc = containerEl.createEl("p");
+    desc.setAttr(
+      "style",
+      "color: var(--text-muted); font-size: 0.9em; margin-top: -0.4em;"
+    );
+    desc.appendText(
+      "Choose where this plugin stores its authorship records. The sidecar " +
+        "folder option keeps one JSON file per note alongside your vault, " +
+        "which gives the cleanest multi-device sync behavior. The data.json " +
+        "option stores everything in a single file inside the plugin folder."
+    );
+
+    new Setting(containerEl)
+      .setName("Storage backend")
+      .setDesc(
+        "Sidecar folder (recommended): one JSON file per note in a vault " +
+          "folder. Each device can edit independently — sync conflicts are " +
+          "detected and merged automatically. data.json: a single file in " +
+          ".obsidian/plugins/aistyled-authorship/. WARNING: simultaneous " +
+          "offline edits on two devices can lose data because the whole " +
+          "file is overwritten by the sync tool."
+      )
+      .addDropdown(drop =>
+        drop
+          .addOption("sidecar", "Sidecar folder (recommended)")
+          .addOption("dataJson", "data.json (single file)")
+          .setValue(this.plugin.settings.storageBackend)
+          .onChange(async value => {
+            const next = value as "sidecar" | "dataJson";
+            if (next === this.plugin.settings.storageBackend) return;
+            const previousBackend = this.plugin.backend;
+            this.plugin.settings.storageBackend = next;
+            await this.plugin.saveSettings();
+            const { migrated } = await this.plugin.reinitBackend(previousBackend);
+            new Notice(
+              `Switched to ${next === "sidecar" ? "Sidecar folder" : "data.json"}. ` +
+                `Migrated ${migrated} record${migrated === 1 ? "" : "s"}.`,
+            );
+            this.display();
+          }),
+      );
+
+    if (this.plugin.settings.storageBackend === "sidecar") {
+      this.renderSidecarFolderControls(containerEl);
+    } else {
+      this.renderDataJsonNotice(containerEl);
+    }
+
+    this.renderDeviceIdRow(containerEl);
+    void this.renderCacheSizeAndDelete(containerEl);
+
+    if (this.plugin.settings.storageBackend === "sidecar") {
+      this.renderRescanConflictsRow(containerEl);
+    }
+  }
+
+  private renderSidecarFolderControls(containerEl: HTMLElement): void {
+    let warningEl!: HTMLElement;
+
+    new Setting(containerEl)
+      .setName("Sidecar folder")
+      .setDesc(
+        "Vault-relative path (e.g. z-author-sync or _meta/authorship). " +
+          "Changing this doesn't move existing data automatically — use the " +
+          "Migrate data now button below when you're ready.",
+      )
+      .addSearch(search => {
+        new FolderSuggest(this.app, search.inputEl);
+        search
+          .setPlaceholder(DEFAULT_SETTINGS.sidecarFolderPath)
+          .setValue(this.plugin.settings.sidecarFolderPath)
+          .onChange(
+            debounce((value: string) => {
+              void this.validateAndSaveSidecarFolder(value, warningEl);
+            }, 400, true),
+          );
+      });
+
+    warningEl = containerEl.createDiv({ cls: "ai-styled-folder-warning" });
+    warningEl.setAttr(
+      "style",
+      "display: none; color: var(--text-error); font-size: 0.85em; margin: -0.2em 0 0.6em 0;",
+    );
+
+    this.renderMigrationBanner(containerEl);
+  }
+
+  private renderDataJsonNotice(containerEl: HTMLElement): void {
+    const note = containerEl.createDiv();
+    note.setAttr(
+      "style",
+      "padding: 0.6em 0.8em; margin: 0.4em 0 0.8em 0; " +
+        "border: 1px solid var(--background-modifier-border); border-radius: 6px; " +
+        "background: var(--background-secondary); font-size: 0.9em;",
+    );
+    note.createEl("strong", { text: "data.json mode active. " });
+    note.appendText(
+      "Authorship records live in .obsidian/plugins/aistyled-authorship/data.json. " +
+        "If both devices edit notes while offline, the sync tool overwrites the " +
+        "whole file — one device's changes will be lost. Switch to Sidecar folder " +
+        "for safer multi-device sync.",
+    );
+  }
+
+  private renderDeviceIdRow(containerEl: HTMLElement): void {
+    new Setting(containerEl)
+      .setName("Device ID")
+      .setDesc(
+        "Identifies this device in the event log so concurrent edits from " +
+          "different devices can be merged correctly. Regenerate if you " +
+          "cloned this vault from another device.",
+      )
+      .addText(text => {
+        text.setValue(this.plugin.settings.deviceId);
+        text.setDisabled(true);
+      })
+      .addButton(btn =>
+        btn
+          .setButtonText("Regenerate")
+          .onClick(async () => {
+            this.plugin.settings.deviceId = "";
+            await this.plugin.saveSettings();
+            // ensureDeviceId only writes when empty; the next call generates a fresh one
+            await this.plugin.ensureDeviceIdPublic();
+            this.display();
+          }),
+      );
+  }
+
+  private async renderCacheSizeAndDelete(containerEl: HTMLElement): Promise<void> {
+    const placeholder = containerEl.createDiv();
+    placeholder.setAttr("style", "min-height: 64px;");
+    let size: CacheSize;
+    try {
+      size = await this.plugin.backend.cacheSize();
+    } catch {
+      size = { bytes: 0, fileCount: 0 };
+    }
+    placeholder.empty();
+
+    const human = formatBytes(size.bytes);
+    const cap = DATA_JSON_SIZE_CAP_BYTES;
+    const pct = Math.min(100, Math.round((size.bytes / cap) * 100));
+    const desc =
+      this.plugin.settings.storageBackend === "dataJson"
+        ? `${human} in data.json across ${size.fileCount} note${size.fileCount === 1 ? "" : "s"} (${pct}% of ${formatBytes(cap)} cap).`
+        : `${human} across ${size.fileCount} sidecar file${size.fileCount === 1 ? "" : "s"}.`;
+
+    new Setting(placeholder)
+      .setName("Authorship cache size")
+      .setDesc(desc)
+      .addButton(btn =>
+        btn
+          .setButtonText("Delete cache")
+          .setWarning()
+          .onClick(() => {
+            new DeleteCacheModal(this.app, this.plugin, size, () => this.display()).open();
+          }),
+      );
+  }
+
+  private renderRescanConflictsRow(containerEl: HTMLElement): void {
+    new Setting(containerEl)
+      .setName("Sync conflicts")
+      .setDesc(
+        "Scan the sidecar folder for conflict copies created by Syncthing, " +
+          "iCloud, Dropbox, OneDrive, or Obsidian Sync, then merge them by " +
+          "newest-event-wins. Runs automatically on startup and when the " +
+          "window regains focus.",
+      )
+      .addButton(btn =>
+        btn
+          .setButtonText("Rescan conflicts")
+          .onClick(async () => {
+            btn.setDisabled(true).setButtonText("Scanning…");
+            const result = await this.plugin.conflictScanner.scanAll();
+            btn.setDisabled(false).setButtonText("Rescan conflicts");
+            const msg =
+              result.merged > 0
+                ? `Merged ${result.merged} conflict file${result.merged === 1 ? "" : "s"}.`
+                : "No conflict files found.";
+            new Notice(msg);
+          }),
+      );
+  }
+
+  private async renderMigrationBanner(containerEl: HTMLElement): Promise<void> {
+    const previous = this.plugin.settings.previousSidecarFolderPath;
+    if (!previous) return;
+    const current = this.plugin.settings.sidecarFolderPath;
+    if (normalizePath(previous) === normalizePath(current)) return;
+    if (this.dismissedMigrationFor === previous) return;
+
+    const count = await this.plugin.countSidecarsAt(previous);
+    if (count === 0) {
+      // Nothing to migrate — clear the stale pointer quietly.
+      this.plugin.settings.previousSidecarFolderPath = null;
+      await this.plugin.saveSettings();
+      return;
+    }
+
+    const banner = containerEl.createDiv({ cls: "ai-styled-migration-banner" });
+    banner.setAttr(
+      "style",
+      "display: flex; align-items: center; gap: 0.6em; flex-wrap: wrap; " +
+        "padding: 0.6em 0.8em; margin-top: 0.4em; " +
+        "border: 1px solid var(--background-modifier-border); border-radius: 6px; " +
+        "background: var(--background-secondary);"
+    );
+
+    const msg = banner.createEl("span");
+    msg.setText(
+      `⚠ ${count} sidecar${count === 1 ? "" : "s"} still at old location: ${previous}/`
+    );
+
+    const migrateBtn = banner.createEl("button", { text: "Migrate data now" });
+    migrateBtn.setAttr("style", "cursor: pointer;");
+    migrateBtn.addEventListener("click", async () => {
+      const copied = await this.plugin.copySidecarsBetween(
+        previous,
+        normalizePath(this.plugin.settings.sidecarFolderPath || DEFAULT_SETTINGS.sidecarFolderPath)
+      );
+      new Notice(
+        `Copied ${copied} sidecar${copied === 1 ? "" : "s"} to ${normalizePath(this.plugin.settings.sidecarFolderPath || DEFAULT_SETTINGS.sidecarFolderPath)}/.`
+      );
+      this.plugin.settings.previousSidecarFolderPath = null;
+      await this.plugin.saveSettings();
+      this.display();
+    });
+
+    const leaveBtn = banner.createEl("button", { text: "Leave in place" });
+    leaveBtn.setAttr("style", "cursor: pointer;");
+    leaveBtn.addEventListener("click", () => {
+      this.dismissedMigrationFor = previous;
+      banner.remove();
+    });
+  }
+
+  // Keystroke-level validation. Shows an inline warning when the path
+  // is not inside the vault; does not save in that case. No Notice
+  // toasts here — they would spam on every keystroke.
+  private async validateAndSaveSidecarFolder(
+    raw: string,
+    warningEl: HTMLElement
+  ): Promise<void> {
+    const showWarning = (msg: string) => {
+      warningEl.setText(msg);
+      warningEl.style.display = "block";
+    };
+    const clearWarning = () => {
+      warningEl.setText("");
+      warningEl.style.display = "none";
+    };
+
+    const trimmed = raw.trim();
+
+    // Absolute OS path check runs BEFORE slash-stripping — if the
+    // original starts with / followed by a system-looking segment, or
+    // a Windows drive letter, reject.
+    if (/^\/(Users|home|var|tmp|etc|private|mnt|opt)\b/i.test(trimmed)) {
+      showWarning("Path must be inside the vault (no absolute OS paths).");
+      return;
+    }
+    if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
+      showWarning("Path must be inside the vault (no absolute drive paths).");
+      return;
+    }
+
+    const stripped = trimmed.replace(/^\/+/u, "").replace(/\/+$/u, "");
+    if (!stripped) {
+      showWarning("Path cannot be empty. Sidecars cannot live at the vault root.");
+      return;
+    }
+
+    const segments = stripped.split("/");
+    if (segments.some(seg => seg === "..")) {
+      showWarning("Path cannot contain `..` segments.");
+      return;
+    }
+
+    const normalized = normalizePath(stripped);
+    if (!normalized || normalized.startsWith("..")) {
+      showWarning("Path must resolve to a location inside the vault.");
+      return;
+    }
+    if (normalized === ".obsidian" || normalized.startsWith(".obsidian/")) {
+      showWarning("Path cannot be inside the .obsidian config folder.");
+      return;
+    }
+
+    clearWarning();
+
+    const oldPath = this.plugin.settings.sidecarFolderPath;
+    if (normalizePath(oldPath) === normalized) return;
+
+    // Only stash the old path as "previous" if it actually has files
+    // worth migrating. Otherwise the banner would appear with count 0
+    // and immediately self-clear.
+    const oldCount = await this.plugin.countSidecarsAt(oldPath);
+    if (oldCount > 0) {
+      this.plugin.settings.previousSidecarFolderPath = oldPath;
+      this.dismissedMigrationFor = null;
+    }
+    this.plugin.settings.sidecarFolderPath = normalized;
+    await this.plugin.saveSettings();
+    this.display();
   }
 }

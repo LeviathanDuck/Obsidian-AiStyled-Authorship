@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.2.0 — 2026-04-17
+
+Major storage iteration. Authorship records now use an event-sourced
+schema with per-event timestamps and device IDs, enabling correct
+last-write-wins resolution when two devices edit the same note while
+offline. Sync-conflict files (Syncthing, iCloud, Dropbox, OneDrive,
+Obsidian Sync) are detected and merged automatically. Schema is
+forward-compatible with the planned multi-author features (Human 1,
+Human 2, AI 2, etc.) — every event carries an `author` field that v0.2
+defaults to `"ai"`.
+
+### Added
+
+- **Storage backend selection** — choose between sidecar folder
+  (recommended; one JSON file per note) and a single `data.json` file.
+  The sidecar folder remains the default.
+- **Event log + snapshot schema (v2)** — every range mutation appends a
+  `{op, author, from, to, ts, dev, id}` event. On load, events are
+  folded onto the snapshot in `(ts, id)` order to produce the current
+  range set. Periodic compaction folds events older than the safety
+  window into the snapshot.
+- **Sync conflict detection and merge** — `ConflictScanner` recognizes
+  Syncthing `.sync-conflict-*`, iCloud `* 2.json`, Dropbox
+  `(conflicted copy)`, OneDrive `-DEVICENAME.json`, and Obsidian Sync
+  `.conflict.json` filename patterns. On a hit, both files are parsed
+  and verified, merged by event union + dedup, and the conflict copy
+  is removed. Runs on plugin load, when the window regains focus, and
+  via a manual "Rescan conflicts" button in settings.
+- **Device ID** — generated on first run, embedded in every event.
+  Visible in settings with a Regenerate button for vault clones.
+- **3.8 MB sync-safe cap** — Obsidian Sync caps individual files at
+  5 MB. The plugin enforces a 3.8 MB cap on each record. When a write
+  would exceed it, aggressive compaction runs first; if still over,
+  the write is refused with a Notice rather than risking sync failure.
+  A one-time per-session warning fires at ~84% of cap.
+- **Cache size display + delete-cache button** — the Data storage
+  settings section shows current usage. The Delete cache button opens
+  a confirmation modal that requires typing `DELETE` (case-insensitive)
+  before destroying all stored authorship records.
+
+### Changed
+
+- **In-memory `AIRange` gains an optional `author` field.** v0.2 always
+  uses `"ai"`; v0.3+ will populate other authors. Range helpers
+  (`mergeRange`, `subtractInterval`, `normalizeRanges`, `sameRanges`)
+  are author-aware: same-author ranges merge, cross-author never do.
+- **Sidecar I/O moved into `StorageBackend` abstraction.** `main.ts`
+  no longer talks to the adapter directly for authorship records.
+  Two backends ship: `SidecarStorage` and `DataJsonStorage`.
+- **v1 → v2 migration** runs lazily on first load of each note. The
+  v1 `ranges` array is upgraded to a v2 snapshot using the file's
+  mtime as the snapshot timestamp; the v2 record is written back on
+  the next mutation.
+
+### Architectural
+
+- Pure-TS schema and helpers in `src/schema.ts` (no Obsidian imports);
+  storage backends in `src/storage.ts`; conflict scanner in
+  `src/conflict.ts`. `main.ts` is the integration layer.
+
 ## 0.1.1 — 2026-04-15
 
 First feature-complete release. The plugin now covers the full workflow: paste
