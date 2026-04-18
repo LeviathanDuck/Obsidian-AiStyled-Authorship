@@ -1890,10 +1890,16 @@ class AuthorshipSettingTab extends PluginSettingTab {
 
   private renderInstallationInstructions() {
     const { containerEl } = this;
+    const usingDataJson = this.plugin.settings.storageBackend === "dataJson";
     const { syncEnabled, otherTypesEnabled } = this.detectSyncConfig();
     const folderHidden = this.isSidecarFolderHidden();
-    const syncProblem = syncEnabled && otherTypesEnabled === false;
-    const setupComplete = folderHidden && !syncProblem;
+    // When using data.json backend, sidecar-specific setup is N/A: no folder
+    // to hide, no sync-type verification needed. Only the style-commands
+    // section remains relevant.
+    const syncProblem = usingDataJson
+      ? false
+      : syncEnabled && otherTypesEnabled === false;
+    const setupComplete = usingDataJson ? true : folderHidden && !syncProblem;
 
     const details = containerEl.createEl("details");
     if (!setupComplete) details.setAttr("open", "");
@@ -1920,8 +1926,10 @@ class AuthorshipSettingTab extends PluginSettingTab {
     const body = details.createDiv();
     body.setAttr("style", "padding: 0 14px 14px 14px;");
 
-    this.renderHideFolderSection(body, folderHidden);
-    this.renderSyncSetupSection(body, syncEnabled, otherTypesEnabled);
+    if (!usingDataJson) {
+      this.renderHideFolderSection(body, folderHidden);
+      this.renderSyncSetupSection(body, syncEnabled, otherTypesEnabled);
+    }
     this.renderStyleCommandsSection(body);
   }
 
@@ -2309,24 +2317,13 @@ class AuthorshipSettingTab extends PluginSettingTab {
 
     // ---- Author block ----
     const authorBlock = containerEl.createDiv({ cls: "asa-author-block" });
-    const authorLink = authorBlock.createEl("a", {
+    const nameDiv = authorBlock.createEl("div", { cls: "asa-author-name" });
+    const nameLink = nameDiv.createEl("a", {
+      text: "Leviathan Duck",
       href: "https://github.com/LeviathanDuck",
     });
-    authorLink.setAttr("target", "_blank");
-    authorLink.setAttr("rel", "noopener");
-    authorLink.createEl("img", {
-      attr: {
-        src: this.app.vault.adapter.getResourcePath(
-          ".obsidian/plugins/aistyled-authorship/assets/LeviathanDuck.png"
-        ),
-        alt: "LeviathanDuck",
-      },
-      cls: "asa-author-avatar",
-    });
-    authorBlock.createEl("div", {
-      cls: "asa-author-name",
-      text: "Leviathan Duck",
-    });
+    nameLink.setAttr("target", "_blank");
+    nameLink.setAttr("rel", "noopener");
     authorBlock.createEl("div", {
       cls: "asa-author-meta",
       text: "Leftcoast Media House Inc.",
