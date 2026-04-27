@@ -1,16 +1,14 @@
-// AI Styled Authorship — storage backends.
+// AI Styled Authorship — storage backend.
 //
-// Two implementations of the StorageBackend interface:
+// SidecarStorage — one JSON file per note, in a vault-relative folder.
+// Per-note conflict isolation is what makes multi-device sync safe.
 //
-//   SidecarStorage — one JSON file per note, in a vault-relative folder.
-//                    Default. Best multi-device conflict isolation.
-//
-//   DataJsonStorage — all notes in one record stored as the
-//                     "authorshipV2" key inside the plugin's data.json.
-//                     Single-file convenience; loses data on simultaneous
-//                     multi-device edits without a sync conflict file.
+// The previous DataJsonStorage backend (one blob inside the plugin's
+// data.json under the "authorshipV2" key) was removed in 0.2.7; see
+// 1.Orthanc workshop note "2026-04-27-data-json-backend-removal-log.md"
+// for the historical record.
 
-import type { DataAdapter, Plugin } from "obsidian";
+import type { DataAdapter } from "obsidian";
 import { normalizePath } from "obsidian";
 import {
   AIRange,
@@ -304,137 +302,9 @@ export class SidecarStorage implements StorageBackend {
   }
 }
 
-// ---- DataJsonStorage ----
-
-// Storage key inside data.json. Settings live at the top level of the
-// blob (this is how Obsidian's saveData/loadData work). The authorship
-// subtree is a sibling key.
-export const DATA_JSON_AUTHORSHIP_KEY = "authorshipV2";
-
-export interface DataJsonShape {
-  [DATA_JSON_AUTHORSHIP_KEY]?: { [notePath: string]: SidecarDataV2 };
-  // Plus any settings keys.
-  [key: string]: unknown;
-}
-
-export class DataJsonStorage implements StorageBackend {
-  constructor(private plugin: Plugin) {}
-
-  sidecarFolder(): string | null {
-    return null;
-  }
-
-  async load(notePath: string): Promise<LoadResult> {
-    const blob = (await this.readBlob());
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    const record = map[notePath];
-    if (!record) return { ranges: [], raw: null };
-    return { ranges: foldEvents(record.snapshot, record.events), raw: record };
-  }
-
-  async appendEvents(
-    notePath: string,
-    events: RangeEvent[],
-  ): Promise<AppendResult> {
-    if (events.length === 0) {
-      return { written: false, bytes: 0, aggressivelyCompacted: false, exceededCap: false };
-    }
-    const blob = await this.readBlob();
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    const prior = map[notePath] ?? null;
-    const merged = mergeEventsIntoRecord(notePath, prior, events);
-    const compacted = maybeCompact(merged);
-    const guarded = ensureUnderCap(compacted);
-    if (guarded.bytes > 3_800_000) {
-      console.warn("[AiStyled WRITE] data.json record over cap even after aggressive compact:", notePath);
-      return { written: false, bytes: guarded.bytes, aggressivelyCompacted: true, exceededCap: true };
-    }
-    map[notePath] = guarded.record;
-    blob[DATA_JSON_AUTHORSHIP_KEY] = map;
-    await this.writeBlob(blob);
-    return {
-      written: true,
-      bytes: guarded.bytes,
-      aggressivelyCompacted: guarded.aggressivelyCompacted,
-      exceededCap: false,
-    };
-  }
-
-  async putRecord(notePath: string, record: SidecarDataV2): Promise<AppendResult> {
-    const guarded = ensureUnderCap(record);
-    if (guarded.bytes > 3_800_000) {
-      return { written: false, bytes: guarded.bytes, aggressivelyCompacted: true, exceededCap: true };
-    }
-    const blob = await this.readBlob();
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    map[notePath] = guarded.record;
-    blob[DATA_JSON_AUTHORSHIP_KEY] = map;
-    await this.writeBlob(blob);
-    return {
-      written: true,
-      bytes: guarded.bytes,
-      aggressivelyCompacted: guarded.aggressivelyCompacted,
-      exceededCap: false,
-    };
-  }
-
-  async rename(fromPath: string, toPath: string): Promise<void> {
-    const blob = await this.readBlob();
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    const record = map[fromPath];
-    if (!record) return;
-    delete map[fromPath];
-    map[toPath] = { ...record, file: toPath };
-    blob[DATA_JSON_AUTHORSHIP_KEY] = map;
-    await this.writeBlob(blob);
-  }
-
-  async delete(notePath: string): Promise<void> {
-    const blob = await this.readBlob();
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    if (!(notePath in map)) return;
-    delete map[notePath];
-    blob[DATA_JSON_AUTHORSHIP_KEY] = map;
-    await this.writeBlob(blob);
-  }
-
-  async listAll(): Promise<string[]> {
-    const blob = await this.readBlob();
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    return Object.keys(map);
-  }
-
-  async cacheSize(): Promise<CacheSize> {
-    const blob = await this.readBlob();
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    const json = JSON.stringify(map);
-    return { bytes: json.length, fileCount: Object.keys(map).length };
-  }
-
-  async deleteAll(): Promise<{ deleted: number }> {
-    const blob = await this.readBlob();
-    const map = blob[DATA_JSON_AUTHORSHIP_KEY] ?? {};
-    const deleted = Object.keys(map).length;
-    delete blob[DATA_JSON_AUTHORSHIP_KEY];
-    await this.writeBlob(blob);
-    return { deleted };
-  }
-
-  private async readBlob(): Promise<DataJsonShape> {
-    const raw = await this.plugin.loadData();
-    if (raw && typeof raw === "object") return raw as DataJsonShape;
-    return {};
-  }
-
-  private async writeBlob(blob: DataJsonShape): Promise<void> {
-    await this.plugin.saveData(blob);
-  }
-}
-
 // ---- Helpers exposed for migration code ----
 
-// Convenience: derive a v2 record from raw bytes (for migration from
-// sidecar → dataJson where we already have the file contents).
+// Convenience: derive a v2 record from raw bytes.
 export async function loadRecordFromSidecarBytes(
   raw: string,
   notePath: string,

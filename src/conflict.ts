@@ -112,7 +112,7 @@ export interface ScanResult {
 export class ConflictScanner {
   constructor(
     private adapter: DataAdapter,
-    private getFolder: () => string | null,
+    private getFolder: () => string,
     private onMerged: (notePath: string) => void,
   ) {}
 
@@ -120,7 +120,6 @@ export class ConflictScanner {
   // Returns true if the file was a recognized conflict and was merged.
   async scanPath(filePath: string): Promise<boolean> {
     const folder = this.getFolder();
-    if (!folder) return false;
     if (!filePath.startsWith(folder + "/")) return false;
     const filename = filePath.slice(folder.length + 1);
     if (filename === README_FILENAME) return false;
@@ -136,7 +135,6 @@ export class ConflictScanner {
   // focus, and on the explicit Rescan Conflicts button.
   async scanAll(): Promise<ScanResult> {
     const folder = this.getFolder();
-    if (!folder) return { scanned: 0, merged: 0, skipped: 0 };
 
     let scanned = 0;
     let merged = 0;

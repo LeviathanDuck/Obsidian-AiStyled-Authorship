@@ -26,6 +26,7 @@ import {
   DATA_JSON_WARN_THRESHOLD,
   DEFAULT_AUTHOR,
   RangeEvent,
+  SidecarDataV2,
   authorOf,
   diffRangeSets,
   generateDeviceId,
@@ -36,7 +37,6 @@ import {
 } from "./src/schema";
 import {
   CacheSize,
-  DataJsonStorage,
   SidecarStorage,
   StorageBackend,
   encodeSidecarPath,
@@ -99,10 +99,6 @@ interface AuthorshipSettings {
   // "Migrate data now" button and the load-time backstop know where old
   // data lives. null when there is nothing to migrate.
   previousSidecarFolderPath: string | null;
-  // v0.2: storage backend selection. "sidecar" = one JSON file per note
-  // in the configured folder (default; recommended for sync robustness).
-  // "dataJson" = all records in the plugin's own data.json.
-  storageBackend: "sidecar" | "dataJson";
   // Stable identifier for this device, embedded in every event so
   // multi-device merges can resolve LWW deterministically. Generated
   // on first run; user-regenerable from settings for vault clones.
@@ -130,7 +126,6 @@ const DEFAULT_SETTINGS: AuthorshipSettings = {
   debug: false,
   sidecarFolderPath: "z-author-sync",
   previousSidecarFolderPath: null,
-  storageBackend: "dataJson",
   deviceId: "",
   deviceLabel: "",
 };
@@ -789,6 +784,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     await this.ensureDeviceId();
     this.backend = this.buildBackend();
     this.conflictScanner = this.buildConflictScanner();
+    await this.migrateDataJsonOnLoad();
 
     this.registerEditorExtension([
       aiRangeField,
@@ -923,11 +919,9 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     // Sidecar arrived via sync — merge its ranges into the current
     // editor state (union of folded ranges). Also opportunistically
     // checks if the touched file is a sync-conflict copy and merges
-    // it into the canonical sidecar. Skipped entirely under the
-    // dataJson backend (sidecar folder is not in use).
+    // it into the canonical sidecar.
     const onSidecarTouched = (filePath: string) => {
-      const folder = this.backend.sidecarFolder();
-      if (!folder) return;
+      const folder = this.sidecarFolder;
       if (!filePath.startsWith(folder + "/")) return;
       const filename = filePath.slice(folder.length + 1);
       if (filename === SIDECAR_README_FILENAME) return;
@@ -1390,16 +1384,13 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
   // ---- backend construction & lifecycle ----
 
   private buildBackend(): StorageBackend {
-    if (this.settings.storageBackend === "dataJson") {
-      return new DataJsonStorage(this);
-    }
     return new SidecarStorage(this.app.vault.adapter, () => this.sidecarFolder);
   }
 
   private buildConflictScanner(): ConflictScanner {
     return new ConflictScanner(
       this.app.vault.adapter,
-      () => this.backend.sidecarFolder(),
+      () => this.sidecarFolder,
       (notePath: string) => {
         const file = this.app.vault.getAbstractFileByPath(notePath);
         if (file instanceof TFile) void this.mergeSidecarIntoView(file);
@@ -1430,32 +1421,55 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     await this.saveSettings();
   }
 
-  // Called from settings when the user switches backend OR when the
-  // sidecar folder path changes. Migrates records from the old backend
-  // into the new one (per-record, so partial failure is recoverable),
-  // then refreshes open editors.
-  async reinitBackend(previousBackend?: StorageBackend): Promise<{ migrated: number }> {
-    const oldBackend = previousBackend ?? this.backend;
-    const newBackend = this.buildBackend();
-    let migrated = 0;
-    try {
-      const paths = await oldBackend.listAll();
-      for (const notePath of paths) {
-        const { raw } = await oldBackend.load(notePath);
-        if (!raw) continue;
-        const result = await newBackend.putRecord(notePath, raw);
-        if (result.written) migrated++;
-      }
-    } catch (err) {
-      console.warn("AiStyled-Authorship: backend migration encountered error", err);
+  // One-shot migration of records left behind in data.json by the
+  // pre-0.2.7 dataJson storage backend. Reads the raw plugin blob,
+  // copies each authorshipV2 entry into the sidecar backend, then
+  // strips the key so subsequent saveSettings doesn't re-persist it.
+  // Idempotent: silently returns when the key is absent or empty.
+  // If any sidecar write fails, the authorshipV2 key is left intact
+  // so the next load can retry.
+  private async migrateDataJsonOnLoad(): Promise<void> {
+    const blob = (await this.loadData()) as Record<string, unknown> | null;
+    if (!blob) return;
+    const raw = blob["authorshipV2"];
+    if (!raw || typeof raw !== "object") return;
+    const map = raw as Record<string, SidecarDataV2>;
+    const entries = Object.entries(map);
+    if (entries.length === 0) {
+      delete blob["authorshipV2"];
+      await this.saveData(blob);
+      delete (this.settings as Record<string, unknown>).authorshipV2;
+      return;
     }
-    this.backend = newBackend;
-    this.conflictScanner = this.buildConflictScanner();
-    this.lastPersisted.clear();
-    this.hydrated.clear();
-    this.warnedNearCap = false;
-    await this.rehydrateAllOpen();
-    return { migrated };
+    let migrated = 0;
+    for (const [notePath, record] of entries) {
+      try {
+        const result = await this.backend.putRecord(notePath, record);
+        if (result.written) {
+          migrated++;
+        } else {
+          console.warn(
+            "AiStyled-Authorship: data.json migration failed for",
+            notePath,
+            result,
+          );
+          return;
+        }
+      } catch (err) {
+        console.warn(
+          "AiStyled-Authorship: data.json migration error for",
+          notePath,
+          err,
+        );
+        return;
+      }
+    }
+    delete blob["authorshipV2"];
+    await this.saveData(blob);
+    delete (this.settings as Record<string, unknown>).authorshipV2;
+    new Notice(
+      `Ai Styled Authorship: migrated ${migrated} record${migrated === 1 ? "" : "s"} from data.json to sidecar.`,
+    );
   }
 
   private get pluginFolderSidecarPath(): string {
@@ -1576,6 +1590,11 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
   async loadSettings() {
     const loaded = (await this.loadData()) ?? {};
     this.settings = { ...DEFAULT_SETTINGS, ...loaded };
+    // Defensive: drop dead keys from previous versions so saveSettings
+    // doesn't re-persist them. authorshipV2 (records map under the old
+    // data.json backend) is migrated and stripped in migrateDataJsonOnLoad;
+    // storageBackend was the dropdown removed in 0.2.7.
+    delete (this.settings as Record<string, unknown>).storageBackend;
   }
 
   async saveSettings() {
@@ -1976,13 +1995,11 @@ class AuthorshipSettingTab extends PluginSettingTab {
 
   private renderInstallationInstructions() {
     const { containerEl } = this;
-    const usingDataJson = this.plugin.settings.storageBackend === "dataJson";
     const folderHidden = this.isSidecarFolderHidden();
-    // Setup is "complete" when the sidecar folder is hidden (data.json
-    // backend has no sidecar folder, so it is always complete). Sync
+    // Setup is "complete" when the sidecar folder is hidden. Sync
     // configuration can't be auto-detected without private API, so the
-    // sync section now just gives unconditional guidance.
-    const setupComplete = usingDataJson ? true : folderHidden;
+    // sync section just gives unconditional guidance.
+    const setupComplete = folderHidden;
 
     const details = containerEl.createEl("details");
     if (!setupComplete) details.setAttr("open", "");
@@ -2009,10 +2026,8 @@ class AuthorshipSettingTab extends PluginSettingTab {
     const body = details.createDiv();
     body.setAttr("style", "padding: 0 14px 14px 14px;");
 
-    if (!usingDataJson) {
-      this.renderHideFolderSection(body, folderHidden);
-      this.renderSyncSetupSection(body);
-    }
+    this.renderHideFolderSection(body, folderHidden);
+    this.renderSyncSetupSection(body);
     this.renderStyleCommandsSection(body);
   }
 
@@ -2407,57 +2422,16 @@ class AuthorshipSettingTab extends PluginSettingTab {
       "color: var(--text-muted); font-size: 0.9em; margin-top: -0.4em;"
     );
     desc.appendText(
-      "Choose where this plugin stores its authorship records. The data.json " +
-        "option (default) keeps everything in a single file inside the plugin " +
-        "folder — simpler for most users. The sidecar folder option keeps " +
-        "one JSON file per note alongside your vault, which scales better " +
-        "and gives stronger multi-device sync behavior."
+      "Authorship records are stored as one JSON file per note in a " +
+        "vault-relative sidecar folder. Per-note files give the strongest " +
+        "multi-device sync behavior — two devices editing different notes " +
+        "offline can never lose each other's data."
     );
 
-    new Setting(containerEl)
-      .setName("Storage backend")
-      .setDesc(
-        "data.json (default): all records in one file inside " +
-          ".obsidian/plugins/aistyled-authorship/. Simple and works well " +
-          "for most vaults. If you have hundreds or thousands of notes " +
-          "with AI styling AND multiple devices editing simultaneously, " +
-          "the sidecar option may be preferable — it scales as one small " +
-          "file per note and uses per-note conflict isolation, so two " +
-          "devices editing different notes offline can never lose each " +
-          "other's data."
-      )
-      .addDropdown(drop =>
-        drop
-          .addOption("dataJson", "data.json (default)")
-          .addOption("sidecar", "Sidecar folder (better at scale)")
-          .setValue(this.plugin.settings.storageBackend)
-          .onChange(async value => {
-            const next = value as "sidecar" | "dataJson";
-            if (next === this.plugin.settings.storageBackend) return;
-            const previousBackend = this.plugin.backend;
-            this.plugin.settings.storageBackend = next;
-            await this.plugin.saveSettings();
-            const { migrated } = await this.plugin.reinitBackend(previousBackend);
-            new Notice(
-              `Switched to ${next === "sidecar" ? "Sidecar folder" : "data.json"}. ` +
-                `Migrated ${migrated} record${migrated === 1 ? "" : "s"}.`,
-            );
-            this.display();
-          }),
-      );
-
-    if (this.plugin.settings.storageBackend === "sidecar") {
-      this.renderSidecarFolderControls(containerEl);
-    } else {
-      this.renderDataJsonNotice(containerEl);
-    }
-
+    this.renderSidecarFolderControls(containerEl);
     this.renderDeviceIdRow(containerEl);
     void this.renderCacheSizeAndDelete(containerEl);
-
-    if (this.plugin.settings.storageBackend === "sidecar") {
-      this.renderRescanConflictsRow(containerEl);
-    }
+    this.renderRescanConflictsRow(containerEl);
   }
 
   private renderSidecarFolderControls(containerEl: HTMLElement): void {
@@ -2489,26 +2463,6 @@ class AuthorshipSettingTab extends PluginSettingTab {
     );
 
     this.renderMigrationBanner(containerEl);
-  }
-
-  private renderDataJsonNotice(containerEl: HTMLElement): void {
-    const note = containerEl.createDiv();
-    note.setAttr(
-      "style",
-      "padding: 0.6em 0.8em; margin: 0.4em 0 0.8em 0; " +
-        "border: 1px solid var(--background-modifier-border); border-radius: 6px; " +
-        "background: var(--background-secondary); font-size: 0.9em;",
-    );
-    note.createEl("strong", { text: "data.json mode active (default). " });
-    note.appendText(
-      "Authorship records live in .obsidian/plugins/aistyled-authorship/data.json. " +
-        "Works well for most vaults. Note: if you have hundreds or thousands of " +
-        "notes with AI styling AND multiple devices editing simultaneously while " +
-        "offline, the sync tool may overwrite the whole file with one device's " +
-        "version, losing the other's changes. In that scenario the Sidecar folder " +
-        "option is preferable — it stores one small file per note so devices " +
-        "editing different notes never collide.",
-    );
   }
 
   private renderDeviceIdRow(containerEl: HTMLElement): void {
@@ -2550,10 +2504,7 @@ class AuthorshipSettingTab extends PluginSettingTab {
     const human = formatBytes(size.bytes);
     const cap = DATA_JSON_SIZE_CAP_BYTES;
     const pct = Math.min(100, Math.round((size.bytes / cap) * 100));
-    const desc =
-      this.plugin.settings.storageBackend === "dataJson"
-        ? `${human} in data.json across ${size.fileCount} note${size.fileCount === 1 ? "" : "s"} (${pct}% of ${formatBytes(cap)} cap).`
-        : `${human} across ${size.fileCount} sidecar file${size.fileCount === 1 ? "" : "s"}.`;
+    const desc = `${human} across ${size.fileCount} sidecar file${size.fileCount === 1 ? "" : "s"} (${pct}% of ${formatBytes(cap)} per-note cap).`;
 
     new Setting(placeholder)
       .setName("Authorship cache size")
