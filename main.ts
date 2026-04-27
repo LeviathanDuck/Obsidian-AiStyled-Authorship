@@ -985,7 +985,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     //
     // TODO: revisit reading-mode support in a future release.
 
-    if (getConfig().debug) {
+    if (this.settings.debug) {
       console.log(
         `AiStyled-Authorship: loaded (${Platform.isMobile ? "mobile" : "desktop"})`
       );
@@ -1480,7 +1480,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
           // skip individual file errors
         }
       }
-      if (copied > 0 && getConfig().debug) {
+      if (copied > 0 && this.settings.debug) {
         console.log(
           `AiStyled-Authorship: copied ${copied} sidecar(s) from ${src}/ to ${dst}/`
         );
@@ -1575,7 +1575,7 @@ export default class LeftcoastAuthorshipPlugin extends Plugin {
     for (const [, id] of this.writeTimers) window.clearTimeout(id);
     this.writeTimers.clear();
     document.body.classList.remove("leftcoast-ai-disabled");
-    if (getConfig().debug) {
+    if (this.settings.debug) {
       console.log("AiStyled-Authorship: unloaded");
     }
   }
